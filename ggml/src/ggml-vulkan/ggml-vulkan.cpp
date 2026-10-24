@@ -4305,7 +4305,10 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         } else if (device->vendor_id == VK_VENDOR_ID_AMD && device->coopmat_support && device->driver_id != vk::DriverId::eAmdProprietary) {
             // This is intentionally using tx_m values, slight performance increase
             l_warptile = { 256, 128, 128, 16, subgroup_size_8, 64, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
-            l_warptile_mmq = l_warptile_mmq_int = { 256, 128, 128, 32, subgroup_size_8, 64, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
+            // BK 64 halves the shared memory load rounds, about 5% faster prompt processing (measured on RX 7800 XT only)
+            const uint32_t l_bk_mmq = device->architecture == vk_device_architecture::AMD_RDNA3 ? 64 : 32;
+            l_warptile_mmq = { 256, 128, 128, l_bk_mmq, subgroup_size_8, 64, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
+            l_warptile_mmq_int = { 256, 128, 128, 32, subgroup_size_8, 64, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
             l_warptile_mmq_int_k = { 256, 128, 128, 32, subgroup_size_16, 64, 1, 4, 2, 1, subgroup_size_16 };
         } else if (device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support) {
             // Xe2/Xe3 with coopmat enabled - warptile performance tuning
@@ -4600,6 +4603,10 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #endif
 
     auto const &ggml_vk_mul_mm_spec = [](std::vector<uint32_t> spec, bool aligned) {
+        // unaligned variants give wrong results with BK > 32 when K is not a multiple of BK*2 (q4_0, k=576)
+        if (!aligned && spec.size() > 3 && spec[3] > 32) {
+            spec[3] = 32;
+        }
         spec.push_back(aligned ? 1u : 0u);
         return spec;
     };
