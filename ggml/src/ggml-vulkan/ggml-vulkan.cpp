@@ -6277,6 +6277,27 @@ static vk_device ggml_vk_get_device(size_t idx) {
         const char* GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM = getenv("GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM");
         device->disable_host_visible_vidmem = GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM != nullptr;
 
+        // Without ReBAR the host-visible VRAM heap is only a small BAR window (usually 256 MiB).
+        // The kernel driver can move buffers in it to system memory, so do not use it.
+        if (!device->disable_host_visible_vidmem && !getenv("GGML_VK_ALLOW_SMALL_BAR")) {
+            const vk::PhysicalDeviceMemoryProperties mem_props = device->physical_device.getMemoryProperties();
+            vk::DeviceSize vram_heap = 0;
+            vk::DeviceSize bar_heap = 0;
+            for (uint32_t i = 0; i < mem_props.memoryTypeCount; i++) {
+                const vk::MemoryType & type = mem_props.memoryTypes[i];
+                if (type.propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal) {
+                    const vk::DeviceSize heap_size = mem_props.memoryHeaps[type.heapIndex].size;
+                    vram_heap = std::max(vram_heap, heap_size);
+                    if (type.propertyFlags & vk::MemoryPropertyFlagBits::eHostVisible) {
+                        bar_heap = std::max(bar_heap, heap_size);
+                    }
+                }
+            }
+            if (bar_heap < vram_heap / 2) {
+                device->disable_host_visible_vidmem = true;
+            }
+        }
+
         const char* GGML_VK_ALLOW_SYSMEM_FALLBACK = getenv("GGML_VK_ALLOW_SYSMEM_FALLBACK");
         device->allow_sysmem_fallback = GGML_VK_ALLOW_SYSMEM_FALLBACK != nullptr;
 
