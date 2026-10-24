@@ -4829,6 +4829,20 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             CREATE_MM2(GGML_TYPE_MXFP4,   pipeline_dequant_mul_mat_mat_id[GGML_TYPE_MXFP4],   matmul_id_subgroup_mxfp4_f32,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
             CREATE_MM2(GGML_TYPE_NVFP4,   pipeline_dequant_mul_mat_mat_id[GGML_TYPE_NVFP4],   matmul_id_subgroup_nvfp4_f32,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
         }
+#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+        if (device->integer_dot_product && device->coopmat_int_support &&
+            device->coopmat_int_m == 16 && device->coopmat_int_n == 16 && device->coopmat_int_k == 16) {
+            // last value: accumulator elements of one invocation share a column (AMD WMMA layout)
+            const uint32_t col_uniform = device->vendor_id == VK_VENDOR_ID_AMD ? 1 : 0;
+            const std::vector<uint32_t> l_wt = { 256, 128, 128, 32, 32, 64, 1, 16, 16, 16, 32, col_uniform };
+            const std::vector<uint32_t> m_wt = { 128,  64,  64, 32, 32, 32, 1, 16, 16, 16, 32, col_uniform };
+            const std::vector<uint32_t> s_wt = {  32,  32,  32, 32, 32, 32, 1, 16, 16, 16, 32, col_uniform };
+            auto & mmq_cm1 = device->pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q8_0].f32acc;
+            ggml_vk_create_pipeline(device, mmq_cm1->l, "matmul_q8_0_q8_1_cm1_l", matmul_q8_0_q8_1_cm1_len, matmul_q8_0_q8_1_cm1_data, "main", 3, sizeof(vk_mat_mat_push_constants), { 128, 128, 1 }, l_wt, 1, false, true, 32);
+            ggml_vk_create_pipeline(device, mmq_cm1->m, "matmul_q8_0_q8_1_cm1_m", matmul_q8_0_q8_1_cm1_len, matmul_q8_0_q8_1_cm1_data, "main", 3, sizeof(vk_mat_mat_push_constants), {  64,  64, 1 }, m_wt, 1, false, true, 32);
+            ggml_vk_create_pipeline(device, mmq_cm1->s, "matmul_q8_0_q8_1_cm1_s", matmul_q8_0_q8_1_cm1_len, matmul_q8_0_q8_1_cm1_data, "main", 3, sizeof(vk_mat_mat_push_constants), {  32,  32, 1 }, s_wt, 1, false, true, 32);
+        }
+#endif
 #undef CREATE_MM2
 #undef CREATE_MM
     } else
@@ -6962,7 +6976,8 @@ static vk_device ggml_vk_get_device(size_t idx) {
                            (vk::ComponentTypeKHR)prop.CType      == vk::ComponentTypeKHR::eSint32 &&
                            (vk::ComponentTypeKHR)prop.ResultType == vk::ComponentTypeKHR::eSint32 &&
                            (vk::ScopeKHR)prop.scope == vk::ScopeKHR::eSubgroup &&
-                           device->coopmat_int_m == 0
+                           device->coopmat_int_m == 0 &&
+                           !getenv("GGML_VK_DISABLE_COOPMAT_INT")
                 ) {
                     device->coopmat_int_support = true;
                     device->coopmat_int_m = prop.MSize;
