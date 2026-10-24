@@ -1,0 +1,61 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+// Quantize f32 activations to int8 with one scale per 256 values (q8_K style).
+// Block layout, 72 int32 words: [0..63] int8 values, [64..67] int16 sums of each 32 values, [68] scale.
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {vec4 data_a[];};
+layout (binding = 1) writeonly buffer D {int32_t data_d[];};
+
+layout (push_constant) uniform parameter
+{
+    uint ne;
+    uint num_blocks;
+} p;
+
+shared float sh_amax[32];
+shared int sh_sum[32];
+
+void main() {
+    const uint t = gl_LocalInvocationID.x;
+
+    for (uint blk = gl_WorkGroupID.x; blk < p.num_blocks; blk += gl_NumWorkGroups.x) {
+        const vec4 x0 = data_a[blk * 64 + t * 2];
+        const vec4 x1 = data_a[blk * 64 + t * 2 + 1];
+
+        const vec4 a = max(abs(x0), abs(x1));
+        sh_amax[t] = max(max(a.x, a.y), max(a.z, a.w));
+        barrier();
+
+        float amax = 0.0f;
+        [[unroll]] for (uint i = 0; i < 32; i++) {
+            amax = max(amax, sh_amax[i]);
+        }
+        const float d = amax / 127.0f;
+        const float id = d != 0.0f ? 1.0f / d : 0.0f;
+
+        const ivec4 q0 = ivec4(round(x0 * id));
+        const ivec4 q1 = ivec4(round(x1 * id));
+        data_d[blk * 72 + t * 2    ] = pack32(i8vec4(q0));
+        data_d[blk * 72 + t * 2 + 1] = pack32(i8vec4(q1));
+
+        sh_sum[t] = q0.x + q0.y + q0.z + q0.w + q1.x + q1.y + q1.z + q1.w;
+        barrier();
+
+        // 4 threads hold one 32-value group; thread t < 4 writes the sums of groups 2t and 2t+1
+        if (t < 4) {
+            const int s0 = sh_sum[8 * t    ] + sh_sum[8 * t + 1] + sh_sum[8 * t + 2] + sh_sum[8 * t + 3];
+            const int s1 = sh_sum[8 * t + 4] + sh_sum[8 * t + 5] + sh_sum[8 * t + 6] + sh_sum[8 * t + 7];
+            data_d[blk * 72 + 64 + t] = (s0 & 0xFFFF) | (s1 << 16);
+        }
+        if (t == 0) {
+            data_d[blk * 72 + 68] = floatBitsToInt(d);
+        }
+        barrier();
+    }
+}

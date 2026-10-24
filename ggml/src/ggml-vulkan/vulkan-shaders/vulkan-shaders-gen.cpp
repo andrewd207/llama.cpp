@@ -632,6 +632,9 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
              tname == "mxfp4" || tname == "q4_k" || tname == "q5_k" || tname == "q6_k")) {
             string_to_spv(shader_name + "_" + tname + "_q8_1", "mul_mmq_cm1.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"D_TYPE", "float"},}), fp16, coopmat, coopmat2, f16acc);
         }
+        if (coopmat && !f16acc && !dot2 && matmul_id_type == MatMulIdType::NONE && tname == "q4_k") {
+            string_to_spv(shader_name + "_" + tname + "_q8_k32", "mul_mmq_cm1.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"D_TYPE", "float"}, {"B_Q8K32", "1"}}), fp16, coopmat, coopmat2, f16acc);
+        }
 #endif
     }
 
@@ -1020,6 +1023,7 @@ void process_shaders() {
     string_to_spv("quantize_q8_1_subgroup", "quantize_q8_1.comp", {{"USE_SUBGROUPS", "1"}});
 
     string_to_spv("quantize_q8_1_x4", "quantize_q8_1.comp", {{"QBLOCK_X4", "1"}});
+    string_to_spv("quantize_q8_k32", "quantize_q8_k32.comp", {});
     string_to_spv("quantize_q8_1_x4_subgroup", "quantize_q8_1.comp", {{"QBLOCK_X4", "1"}, {"USE_SUBGROUPS", "1"}});
 
     string_to_spv("mul_f32", "mul.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});

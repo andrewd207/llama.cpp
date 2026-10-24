@@ -24,7 +24,12 @@ layout (binding = 0) readonly buffer A_PACKED16 {A_TYPE_PACKED16 data_a_packed16
 #if defined(A_TYPE_PACKED32)
 layout (binding = 0) readonly buffer A_PACKED32 {A_TYPE_PACKED32 data_a_packed32[];};
 #endif
+#if defined(B_Q8K32)
+// q8_k32 activations: 72 int32 words per 256 values, see quantize_q8_k32.comp
+layout (binding = 1) readonly buffer B {int32_t data_b32[];};
+#else
 layout (binding = 1) readonly buffer B {block_q8_1_x4_packed128 data_b[];};
+#endif
 layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
 
 layout (push_constant) uniform parameter
@@ -66,7 +71,11 @@ layout (constant_id = 11) const bool COL_UNIFORM = false;
 
 // HAS_MIN: block value is scale * q + min, dm = (scale * d_b, min) adds dm.y * s_b
 // SPLIT16: two scales per 32 values (one per 16), dm = (scale_lo, scale_hi)
-#if defined(DATA_A_Q4_1) || defined(DATA_A_Q5_1) || defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K)
+// INT_DOMAIN: K-quant with q8_k32 activations; integer sub-block scales and mins are applied in int32,
+//             the float scales once per 256 values. dm = (d, dmin) of the super-block.
+#if defined(B_Q8K32)
+#define INT_DOMAIN
+#elif defined(DATA_A_Q4_1) || defined(DATA_A_Q5_1) || defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K)
 #define HAS_MIN
 #endif
 #if defined(DATA_A_Q6_K)
@@ -81,6 +90,10 @@ shared int32_t buf_a[BK_STEP * BM * QS_STRIDE];
 shared vec2 buf_a_dm[BK_STEP * BM];
 shared int32_t buf_b[BK_STEP * BN * QS_STRIDE];
 shared vec2 buf_b_ds[BK_STEP * BN];
+#ifdef INT_DOMAIN
+// per row and 32-value sub-block: integer scale | (integer min << 8)
+shared uint32_t buf_a_scm[BK_STEP * BM];
+#endif
 shared int32_t probe[CM * CM];
 
 // load_a_qs returns the 4 int8 values 4*iqs .. 4*iqs+3 of 32-value block ib
@@ -172,7 +185,7 @@ int32_t load_a_qs(const uint ib, const uint iqs) {
     return int32_t(q | (((data_a_packed32[ib_k].qh[iqs] >> is) & 0x01010101) << 4));
 #endif
 }
-vec2 load_a_dm(const uint ib) {
+u8vec2 load_a_scale_min(const uint ib) {
     const uint ib_k = ib / 8;
     const uint is = ib % 8;
     u8vec2 scale_dm;
@@ -182,9 +195,22 @@ vec2 load_a_dm(const uint ib) {
         scale_dm = u8vec2((data_a[ib_k].scales[is+4] & 0xF) | ((data_a[ib_k].scales[is-4] & 0xC0) >> 2),
                           (data_a[ib_k].scales[is+4] >>  4) | ((data_a[ib_k].scales[is  ] & 0xC0) >> 2));
     }
-    const vec2 dm = vec2(data_a_packed32[ib_k].dm) * vec2(scale_dm);
+    return scale_dm;
+}
+#ifdef INT_DOMAIN
+vec2 load_a_dm(const uint ib) {
+    return vec2(data_a_packed32[ib / 8].dm);
+}
+uint32_t load_a_scm(const uint ib) {
+    const u8vec2 sm = load_a_scale_min(ib);
+    return uint32_t(sm.x) | (uint32_t(sm.y) << 8);
+}
+#else
+vec2 load_a_dm(const uint ib) {
+    const vec2 dm = vec2(data_a_packed32[ib / 8].dm) * vec2(load_a_scale_min(ib));
     return vec2(dm.x, -dm.y);
 }
+#endif
 #endif
 
 #if defined(DATA_A_Q6_K)
@@ -216,6 +242,9 @@ const uint B_LOADS = (BK_STEP * BN * 2) / BLOCK_SIZE;
 
 int32_t ra_q[A_LOADS];
 vec2 ra_dm[A_LOADS];
+#ifdef INT_DOMAIN
+uint32_t ra_scm[A_LOADS];
+#endif
 ivec4 rb_q[B_LOADS];
 vec2 rb_ds[B_LOADS];
 
@@ -231,6 +260,9 @@ void fetch_tiles(const uint block, const uint end_k, const uint pos_a_ib, const 
         ra_q[j] = ok ? load_a_qs(ib, iqs) : 0;
         if (iqs == 0) {
             ra_dm[j] = ok ? load_a_dm(ib) : vec2(0.0f);
+#ifdef INT_DOMAIN
+            ra_scm[j] = ok ? load_a_scm(ib) : 0;
+#endif
         }
     }
     [[unroll]] for (uint j = 0; j < B_LOADS; j++) {
@@ -241,10 +273,23 @@ void fetch_tiles(const uint block, const uint end_k, const uint pos_a_ib, const 
         const bool ok = ic * BN + col < p.N && block + k_step * BK < end_k;
         const uint ib = pos_b_ib + col * p.stride_b / BK + k_step;
 
+#if defined(B_Q8K32)
+        // ib counts 32-value groups: 256-value block ib / 8, group ib % 8
+        const uint w = (ib / 8) * 72;
+        const uint g = ib % 8;
+        rb_q[j] = ok ? ivec4(data_b32[w + g * 8 + half_i * 4], data_b32[w + g * 8 + half_i * 4 + 1],
+                             data_b32[w + g * 8 + half_i * 4 + 2], data_b32[w + g * 8 + half_i * 4 + 3]) : ivec4(0);
+        if (half_i == 0) {
+            // (scale of the 256 values, int16 sum of this group)
+            const int bsum = (data_b32[w + 64 + g / 2] << (16 * (1 - g % 2))) >> 16;
+            rb_ds[j] = ok ? vec2(intBitsToFloat(data_b32[w + 68]), float(bsum)) : vec2(0.0f);
+        }
+#else
         rb_q[j] = ok ? data_b[ib / 4].qs[(ib % 4) * 2 + half_i] : ivec4(0);
         if (half_i == 0) {
             rb_ds[j] = ok ? vec2(data_b[ib / 4].ds[ib % 4]) : vec2(0.0f);
         }
+#endif
     }
 }
 
@@ -258,6 +303,9 @@ void store_tiles() {
         buf_a[(k_step * BM + row) * QS_STRIDE + iqs] = ra_q[j];
         if (iqs == 0) {
             buf_a_dm[k_step * BM + row] = ra_dm[j];
+#ifdef INT_DOMAIN
+            buf_a_scm[k_step * BM + row] = ra_scm[j];
+#endif
         }
     }
     [[unroll]] for (uint j = 0; j < B_LOADS; j++) {
@@ -323,6 +371,22 @@ void main() {
     [[unroll]] for (uint i = 0; i < cms_per_row * cms_per_col * ELEMS; i++) {
         sums[i] = 0.0f;
     }
+#ifdef INT_DOMAIN
+    // isum: sum of sc * (acc + 2^23), biased so the product is unsigned 24-bit (full-rate multiply).
+    // corr: sum of sc per row, removes the bias (wrap-around int32 math is exact). fmin: sum of m * bsum.
+    uint32_t isum[cms_per_row * cms_per_col * ELEMS];
+    float fmin[cms_per_row * cms_per_col * ELEMS];
+    uint32_t corr[cms_per_row * ELEMS];
+    [[unroll]] for (uint i = 0; i < cms_per_row * cms_per_col * ELEMS; i++) {
+        isum[i] = 0;
+        fmin[i] = 0.0f;
+    }
+    [[unroll]] for (uint i = 0; i < cms_per_row * ELEMS; i++) {
+        corr[i] = 0;
+    }
+    uint32_t sc_a[ELEMS];
+    float m_a[ELEMS];
+#endif
 
     uint pos_a_ib = batch_idx_a * (p.batch_stride_a / BK) + (ir * BM * p.stride_a + start_k) / BK;
     uint pos_b_ib = (batch_idx * p.batch_stride_b + ic * BN * p.stride_b + start_k) / BK;
@@ -361,12 +425,23 @@ void main() {
                 }
             }
 
+#ifdef INT_DOMAIN
+            // apply the float scales at the end of each 256-value block and at the end of this split
+            const uint kk = block + k_step * BK;
+            const bool last_group = kk % 256 == 256 - BK || kk + BK >= end_k;
+#endif
             [[unroll]] for (uint cm_row = 0; cm_row < cms_per_row; cm_row++) {
                 const uint row0 = k_step * BM + warp_r * WM + cm_row * CM;
                 coopMatLoad(cm_a[0], buf_a, row0 * QS_STRIDE,     QS_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
                 coopMatLoad(cm_a[1], buf_a, row0 * QS_STRIDE + 4, QS_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
                 [[unroll]] for (uint i = 0; i < ELEMS; i++) {
                     d_a[i] = buf_a_dm[row0 + elem_r[i]];
+#ifdef INT_DOMAIN
+                    const uint32_t scm = buf_a_scm[row0 + elem_r[i]];
+                    sc_a[i] = scm & 0xFF;
+                    m_a[i] = float((scm >> 8) & 0xFF);
+                    corr[cm_row * ELEMS + i] += sc_a[i];
+#endif
                 }
 
                 // issue all matrix ops of this row before the scale math, so they can overlap
@@ -385,7 +460,16 @@ void main() {
                     const uint s = (cm_col * cms_per_row + cm_row) * ELEMS;
                     [[unroll]] for (uint i = 0; i < ELEMS; i++) {
                         const vec2 db = d_b[cm_col * ELEMS + (COL_UNIFORM ? 0 : i)];
-#ifdef SPLIT16
+#if defined(INT_DOMAIN)
+                        isum[s + i] += sc_a[i] * (uint32_t(cm_acc[cm_col][i] + 0x800000) & 0xFFFFFFu);
+                        fmin[s + i] += m_a[i] * db.y;
+                        if (last_group) {
+                            const int32_t v = int32_t(isum[s + i] - (corr[cm_row * ELEMS + i] << 23));
+                            sums[s + i] += float(v) * (d_a[i].x * db.x) - fmin[s + i] * (d_a[i].y * db.x);
+                            isum[s + i] = 0;
+                            fmin[s + i] = 0.0f;
+                        }
+#elif defined(SPLIT16)
                         sums[s + i] += float(cm_acc[cm_col * 2][i]) * (d_a[i].x * db.x) + float(cm_acc[cm_col * 2 + 1][i]) * (d_a[i].y * db.x);
 #else
                         sums[s + i] += float(cm_acc[cm_col][i]) * (d_a[i].x * db.x);
@@ -395,6 +479,13 @@ void main() {
 #endif
                     }
                 }
+#ifdef INT_DOMAIN
+                if (last_group) {
+                    [[unroll]] for (uint i = 0; i < ELEMS; i++) {
+                        corr[cm_row * ELEMS + i] = 0;
+                    }
+                }
+#endif
             }
         }
 
