@@ -3812,6 +3812,10 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
     result.block_cols = coopmat_block_cols * num_subgroups;
     result.row_split = num_subgroups;
     result.subgroup_size = device->subgroup_size;
+    if (device->architecture == vk_device_architecture::AMD_RDNA3) {
+        // WMMA is native wave32
+        result.subgroup_size = 32;
+    }
     result.workgroup_size = num_subgroups * result.subgroup_size;
 
     const uint32_t D_lsb = D ^ (D & (D-1));  // extract lowest set bit
@@ -4314,6 +4318,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 l_warptile_mmq = { 256, 128, 128, l_bk_mmq, 64, 32, 2, tm_m, tn_m, tk_m, 32 };
                 m_warptile_mmq = { 128,  64,  64, 32, 32, 32, 2, tm_m, tn_m, tk_m, 32 };
                 s_warptile_mmq = {  32,  32,  32, 32, 32, 32, 2, tm_m, tn_m, tk_m, 32 };
+                l_warptile = { 256, 128, 128, 16, 64, 32, 2, tm_m, tn_m, tk_m, 32 };
+                m_warptile = { 128,  64,  64, 16, 32, 32, 2, tm_m, tn_m, tk_m, 32 };
+                s_warptile = {  32,  32,  32, 16, 32, 32, 2, tm_m, tn_m, tk_m, 32 };
             }
             l_warptile_mmq_int_k = { 256, 128, 128, 32, subgroup_size_16, 64, 1, 4, 2, 1, subgroup_size_16 };
         } else if (device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support) {
