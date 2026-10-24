@@ -21,6 +21,9 @@ layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
 #if defined(A_TYPE_PACKED16)
 layout (binding = 0) readonly buffer A_PACKED16 {A_TYPE_PACKED16 data_a_packed16[];};
 #endif
+#if defined(A_TYPE_PACKED32)
+layout (binding = 0) readonly buffer A_PACKED32 {A_TYPE_PACKED32 data_a_packed32[];};
+#endif
 layout (binding = 1) readonly buffer B {block_q8_1_x4_packed128 data_b[];};
 layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
 
@@ -61,23 +64,150 @@ layout (constant_id = 11) const bool COL_UNIFORM = false;
 // int32 words per cached row: 32 int8 values, no padding (padding was slower on RADV)
 #define QS_STRIDE 8
 
+// HAS_MIN: block value is scale * q + min, dm = (scale * d_b, min) adds dm.y * s_b
+// SPLIT16: two scales per 32 values (one per 16), dm = (scale_lo, scale_hi)
+#if defined(DATA_A_Q4_1) || defined(DATA_A_Q5_1) || defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K)
+#define HAS_MIN
+#endif
+#if defined(DATA_A_Q6_K)
+#define SPLIT16
+#endif
+
 const uint ELEMS = (CM * CM) / WARP;
 const uint cms_per_row = WM / CM;
 const uint cms_per_col = WN / CM;
 
 shared int32_t buf_a[BK_STEP * BM * QS_STRIDE];
-shared float buf_a_d[BK_STEP * BM];
+shared vec2 buf_a_dm[BK_STEP * BM];
 shared int32_t buf_b[BK_STEP * BN * QS_STRIDE];
-shared float buf_b_d[BK_STEP * BN];
+shared vec2 buf_b_ds[BK_STEP * BN];
 shared int32_t probe[CM * CM];
 
+// load_a_qs returns the 4 int8 values 4*iqs .. 4*iqs+3 of 32-value block ib
 #if defined(DATA_A_Q8_0)
 int32_t load_a_qs(const uint ib, const uint iqs) {
     return pack32(i16vec2(data_a_packed16[ib].qs[iqs * 2], data_a_packed16[ib].qs[iqs * 2 + 1]));
 }
+vec2 load_a_dm(const uint ib) {
+    return vec2(float(data_a_packed16[ib].d), 0.0f);
+}
+#endif
 
-float load_a_d(const uint ib) {
-    return float(data_a_packed16[ib].d);
+#if defined(DATA_A_Q4_0) || defined(DATA_A_Q4_1) || defined(DATA_A_Q5_0) || defined(DATA_A_Q5_1)
+// low nibbles hold values 0..15, high nibbles values 16..31
+uint32_t load_a_nibbles(const uint ib, const uint iqs) {
+    const uint32_t u = pack32(u16vec2(data_a_packed16[ib].qs[(iqs % 4) * 2], data_a_packed16[ib].qs[(iqs % 4) * 2 + 1]));
+    return (u >> (4 * (iqs / 4))) & 0x0F0F0F0F;
+}
+#endif
+
+#if defined(DATA_A_Q5_0) || defined(DATA_A_Q5_1)
+// fifth bit of values 4*iqs .. 4*iqs+3, moved to bit 4 of each byte
+uint32_t q5_high_bits(const uint32_t qh, const uint iqs) {
+    const uint32_t hb = (qh >> (4 * iqs)) & 0xF;
+    return ((hb & 1u) | ((hb & 2u) << 7) | ((hb & 4u) << 14) | ((hb & 8u) << 21)) << 4;
+}
+#endif
+
+#if defined(DATA_A_Q4_0)
+int32_t load_a_qs(const uint ib, const uint iqs) {
+    // bytes 0..15 -> -8..7 without carries between bytes
+    return int32_t((load_a_nibbles(ib, iqs) + 0x78787878u) ^ 0x80808080u);
+}
+vec2 load_a_dm(const uint ib) {
+    return vec2(float(data_a_packed16[ib].d), 0.0f);
+}
+#endif
+
+#if defined(DATA_A_Q4_1)
+int32_t load_a_qs(const uint ib, const uint iqs) {
+    return int32_t(load_a_nibbles(ib, iqs));
+}
+vec2 load_a_dm(const uint ib) {
+    return vec2(float(data_a_packed16[ib].d), float(data_a_packed16[ib].m));
+}
+#endif
+
+#if defined(DATA_A_Q5_0)
+int32_t load_a_qs(const uint ib, const uint iqs) {
+    const uint32_t qh = pack32(u16vec2(data_a_packed16[ib].qh[0], data_a_packed16[ib].qh[1]));
+    // bytes 0..31 -> -16..15
+    return int32_t(((load_a_nibbles(ib, iqs) | q5_high_bits(qh, iqs)) + 0x70707070u) ^ 0x80808080u);
+}
+vec2 load_a_dm(const uint ib) {
+    return vec2(float(data_a_packed16[ib].d), 0.0f);
+}
+#endif
+
+#if defined(DATA_A_Q5_1)
+int32_t load_a_qs(const uint ib, const uint iqs) {
+    return int32_t(load_a_nibbles(ib, iqs) | q5_high_bits(data_a_packed16[ib].qh, iqs));
+}
+vec2 load_a_dm(const uint ib) {
+    return vec2(float(data_a_packed16[ib].d), float(data_a_packed16[ib].m));
+}
+#endif
+
+#if defined(DATA_A_MXFP4)
+int32_t load_a_qs(const uint ib, const uint iqs) {
+    const uint b = (iqs % 4) * 4;
+    const uint32_t u = pack32(u8vec4(data_a[ib].qs[b], data_a[ib].qs[b + 1], data_a[ib].qs[b + 2], data_a[ib].qs[b + 3]));
+    const u8vec4 n = unpack8((u >> (4 * (iqs / 4))) & 0x0F0F0F0F);
+    return pack32(i8vec4(kvalues_mxfp4[n.x], kvalues_mxfp4[n.y], kvalues_mxfp4[n.z], kvalues_mxfp4[n.w]));
+}
+vec2 load_a_dm(const uint ib) {
+    return vec2(e8m0_to_fp32(data_a[ib].e) * 0.5f, 0.0f);
+}
+#endif
+
+#if defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K)
+// 8 sub-blocks of 32 per super-block; sub-block is = ib % 8 lives in nibble half is % 2 of qs group is / 2
+int32_t load_a_qs(const uint ib, const uint iqs) {
+    const uint ib_k = ib / 8;
+    const uint is = ib % 8;
+    const uint32_t q = (data_a_packed32[ib_k].qs[8 * (is / 2) + iqs] >> (4 * (is % 2))) & 0x0F0F0F0F;
+#if defined(DATA_A_Q4_K)
+    return int32_t(q);
+#else
+    return int32_t(q | (((data_a_packed32[ib_k].qh[iqs] >> is) & 0x01010101) << 4));
+#endif
+}
+vec2 load_a_dm(const uint ib) {
+    const uint ib_k = ib / 8;
+    const uint is = ib % 8;
+    u8vec2 scale_dm;
+    if (is < 4) {
+        scale_dm = u8vec2(data_a[ib_k].scales[is] & 0x3F, data_a[ib_k].scales[is + 4] & 0x3F);
+    } else {
+        scale_dm = u8vec2((data_a[ib_k].scales[is+4] & 0xF) | ((data_a[ib_k].scales[is-4] & 0xC0) >> 2),
+                          (data_a[ib_k].scales[is+4] >>  4) | ((data_a[ib_k].scales[is  ] & 0xC0) >> 2));
+    }
+    const vec2 dm = vec2(data_a_packed32[ib_k].dm) * vec2(scale_dm);
+    return vec2(dm.x, -dm.y);
+}
+#endif
+
+#if defined(DATA_A_Q6_K)
+// sub-block sb = ib % 8: 128-value half sb / 4, quarter q = sb % 4 selects the ql nibble and qh bit pair
+int32_t load_a_qs(const uint ib, const uint iqs) {
+    const uint ib_k = ib / 8;
+    const uint sb = ib % 8;
+    const uint half_i = sb / 4;
+    const uint q = sb % 4;
+    const uint ql_idx = (64 * half_i + 32 * (q & 1) + 4 * iqs) / 2;
+    const uint qh_idx = (32 * half_i + 4 * iqs) / 2;
+    const uint32_t ql = pack32(u16vec2(data_a_packed16[ib_k].ql[ql_idx], data_a_packed16[ib_k].ql[ql_idx + 1]));
+    const uint32_t qh = pack32(u16vec2(data_a_packed16[ib_k].qh[qh_idx], data_a_packed16[ib_k].qh[qh_idx + 1]));
+    const uint32_t v = ((ql >> (4 * (q >> 1))) & 0x0F0F0F0F) | (((qh >> (2 * q)) & 0x03030303) << 4);
+    // bytes 0..63 -> -32..31
+    return int32_t((v + 0x60606060u) ^ 0x80808080u);
+}
+vec2 load_a_dm(const uint ib) {
+    const uint ib_k = ib / 8;
+    const uint sb = ib % 8;
+    const i8vec2 sc = unpack8(data_a_packed16[ib_k].scales[4 * (sb / 4) + sb % 4]);
+    const float d = float(data_a_packed16[ib_k].d);
+    return vec2(d * float(sc.x), d * float(sc.y));
 }
 #endif
 
@@ -85,9 +215,9 @@ const uint A_LOADS = (BK_STEP * BM * 8) / BLOCK_SIZE;
 const uint B_LOADS = (BK_STEP * BN * 2) / BLOCK_SIZE;
 
 int32_t ra_q[A_LOADS];
-float ra_d[A_LOADS];
+vec2 ra_dm[A_LOADS];
 ivec4 rb_q[B_LOADS];
-float rb_d[B_LOADS];
+vec2 rb_ds[B_LOADS];
 
 void fetch_tiles(const uint block, const uint end_k, const uint pos_a_ib, const uint pos_b_ib, const uint ir, const uint ic) {
     [[unroll]] for (uint j = 0; j < A_LOADS; j++) {
@@ -100,7 +230,7 @@ void fetch_tiles(const uint block, const uint end_k, const uint pos_a_ib, const 
 
         ra_q[j] = ok ? load_a_qs(ib, iqs) : 0;
         if (iqs == 0) {
-            ra_d[j] = ok ? load_a_d(ib) : 0.0f;
+            ra_dm[j] = ok ? load_a_dm(ib) : vec2(0.0f);
         }
     }
     [[unroll]] for (uint j = 0; j < B_LOADS; j++) {
@@ -113,7 +243,7 @@ void fetch_tiles(const uint block, const uint end_k, const uint pos_a_ib, const 
 
         rb_q[j] = ok ? data_b[ib / 4].qs[(ib % 4) * 2 + half_i] : ivec4(0);
         if (half_i == 0) {
-            rb_d[j] = ok ? float(data_b[ib / 4].ds[ib % 4].x) : 0.0f;
+            rb_ds[j] = ok ? vec2(data_b[ib / 4].ds[ib % 4]) : vec2(0.0f);
         }
     }
 }
@@ -127,7 +257,7 @@ void store_tiles() {
 
         buf_a[(k_step * BM + row) * QS_STRIDE + iqs] = ra_q[j];
         if (iqs == 0) {
-            buf_a_d[k_step * BM + row] = ra_d[j];
+            buf_a_dm[k_step * BM + row] = ra_dm[j];
         }
     }
     [[unroll]] for (uint j = 0; j < B_LOADS; j++) {
@@ -142,12 +272,16 @@ void store_tiles() {
         buf_b[dst + 2] = rb_q[j].z;
         buf_b[dst + 3] = rb_q[j].w;
         if (half_i == 0) {
-            buf_b_d[k_step * BN + col] = rb_d[j];
+            buf_b_ds[k_step * BN + col] = rb_ds[j];
         }
     }
 }
 
 void main() {
+#ifdef NEEDS_INIT_IQ_SHMEM
+    init_iq_shmem(gl_WorkGroupSize);
+#endif
+
     const uint tid = gl_LocalInvocationID.x;
 
     const uint batch_idx = gl_WorkGroupID.z + p.base_work_group_z;
@@ -193,11 +327,17 @@ void main() {
     uint pos_a_ib = batch_idx_a * (p.batch_stride_a / BK) + (ir * BM * p.stride_a + start_k) / BK;
     uint pos_b_ib = (batch_idx * p.batch_stride_b + ic * BN * p.stride_b + start_k) / BK;
 
+#ifdef SPLIT16
+    const uint ACCS = 2;
+#else
+    const uint ACCS = 1;
+#endif
+
     coopmat<int8_t, gl_ScopeSubgroup, CM, CM, gl_MatrixUseA> cm_a[2];
     coopmat<int8_t, gl_ScopeSubgroup, CM, CM, gl_MatrixUseB> cm_b[2 * cms_per_col];
-    coopmat<int32_t, gl_ScopeSubgroup, CM, CM, gl_MatrixUseAccumulator> cm_acc[cms_per_col];
-    float d_a[ELEMS];
-    float d_b[cms_per_col * ELEMS];
+    coopmat<int32_t, gl_ScopeSubgroup, CM, CM, gl_MatrixUseAccumulator> cm_acc[ACCS * cms_per_col];
+    vec2 d_a[ELEMS];
+    vec2 d_b[cms_per_col * ELEMS];
 
     for (uint block = start_k; block < end_k; block += BK * BK_STEP) {
         fetch_tiles(block, end_k, pos_a_ib, pos_b_ib, ir, ic);
@@ -213,10 +353,10 @@ void main() {
                 coopMatLoad(cm_b[cm_col * 2    ], buf_b, col0 * QS_STRIDE,     QS_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
                 coopMatLoad(cm_b[cm_col * 2 + 1], buf_b, col0 * QS_STRIDE + 4, QS_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
                 if (COL_UNIFORM) {
-                    d_b[cm_col * ELEMS] = buf_b_d[col0 + elem_c[0]];
+                    d_b[cm_col * ELEMS] = buf_b_ds[col0 + elem_c[0]];
                 } else {
                     [[unroll]] for (uint i = 0; i < ELEMS; i++) {
-                        d_b[cm_col * ELEMS + i] = buf_b_d[col0 + elem_c[i]];
+                        d_b[cm_col * ELEMS + i] = buf_b_ds[col0 + elem_c[i]];
                     }
                 }
             }
@@ -226,20 +366,33 @@ void main() {
                 coopMatLoad(cm_a[0], buf_a, row0 * QS_STRIDE,     QS_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
                 coopMatLoad(cm_a[1], buf_a, row0 * QS_STRIDE + 4, QS_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
                 [[unroll]] for (uint i = 0; i < ELEMS; i++) {
-                    d_a[i] = buf_a_d[row0 + elem_r[i]];
+                    d_a[i] = buf_a_dm[row0 + elem_r[i]];
                 }
 
                 // issue all matrix ops of this row before the scale math, so they can overlap
                 [[unroll]] for (uint cm_col = 0; cm_col < cms_per_col; cm_col++) {
-                    cm_acc[cm_col] = coopmat<int32_t, gl_ScopeSubgroup, CM, CM, gl_MatrixUseAccumulator>(0);
-                    cm_acc[cm_col] = coopMatMulAdd(cm_a[0], cm_b[cm_col * 2    ], cm_acc[cm_col]);
+                    const coopmat<int32_t, gl_ScopeSubgroup, CM, CM, gl_MatrixUseAccumulator> zero = coopmat<int32_t, gl_ScopeSubgroup, CM, CM, gl_MatrixUseAccumulator>(0);
+#ifdef SPLIT16
+                    cm_acc[cm_col * 2    ] = coopMatMulAdd(cm_a[0], cm_b[cm_col * 2    ], zero);
+                    cm_acc[cm_col * 2 + 1] = coopMatMulAdd(cm_a[1], cm_b[cm_col * 2 + 1], zero);
+#else
+                    cm_acc[cm_col] = coopMatMulAdd(cm_a[0], cm_b[cm_col * 2    ], zero);
                     cm_acc[cm_col] = coopMatMulAdd(cm_a[1], cm_b[cm_col * 2 + 1], cm_acc[cm_col]);
+#endif
                 }
 
                 [[unroll]] for (uint cm_col = 0; cm_col < cms_per_col; cm_col++) {
                     const uint s = (cm_col * cms_per_row + cm_row) * ELEMS;
                     [[unroll]] for (uint i = 0; i < ELEMS; i++) {
-                        sums[s + i] += float(cm_acc[cm_col][i]) * (d_a[i] * d_b[cm_col * ELEMS + (COL_UNIFORM ? 0 : i)]);
+                        const vec2 db = d_b[cm_col * ELEMS + (COL_UNIFORM ? 0 : i)];
+#ifdef SPLIT16
+                        sums[s + i] += float(cm_acc[cm_col * 2][i]) * (d_a[i].x * db.x) + float(cm_acc[cm_col * 2 + 1][i]) * (d_a[i].y * db.x);
+#else
+                        sums[s + i] += float(cm_acc[cm_col][i]) * (d_a[i].x * db.x);
+#ifdef HAS_MIN
+                        sums[s + i] += d_a[i].y * db.y;
+#endif
+#endif
                     }
                 }
             }
