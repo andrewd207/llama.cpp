@@ -5205,6 +5205,63 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+// FFN down projection of a swiglu of the gate and up projections, dense or with experts
+// (backends may compute the swiglu inside the down projection)
+struct test_mul_mat_swiglu : public test_case {
+    const ggml_type type_a;
+    const bool experts;
+    const bool oai;
+    const int64_t n_embd;
+    const int64_t n_ff;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_SWIGLU";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR5(type_a, experts, oai, n_embd, n_ff);
+    }
+
+    test_mul_mat_swiglu(ggml_type type_a = GGML_TYPE_Q4_K, bool experts = false, bool oai = false,
+            int64_t n_embd = 256, int64_t n_ff = 2048)
+        : type_a(type_a), experts(experts), oai(oai), n_embd(n_embd), n_ff(n_ff) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int n_mats = 8;
+        const int n_used = 4;
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 1, 1);
+        ggml_tensor * gate;
+        ggml_tensor * up;
+        ggml_tensor * w_down;
+        ggml_tensor * ids = nullptr;
+        if (experts) {
+            ids = ggml_view_2d(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, 1), n_used, 1, n_mats * sizeof(int32_t), 0);
+            gate   = ggml_mul_mat_id(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_ff, n_mats), x, ids);
+            up     = ggml_mul_mat_id(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_ff, n_mats), x, ids);
+            w_down = ggml_new_tensor_3d(ctx, type_a, n_ff, n_embd, n_mats);
+        } else {
+            gate   = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_ff), x);
+            up     = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_ff), x);
+            w_down = ggml_new_tensor_2d(ctx, type_a, n_ff, n_embd);
+        }
+        ggml_tensor * act = oai ? ggml_swiglu_oai(ctx, gate, up, 1.702f, 7.0f) : ggml_swiglu_split(ctx, gate, up);
+        ggml_tensor * out = experts ? ggml_mul_mat_id(ctx, w_down, act, ids) : ggml_mul_mat(ctx, w_down, act);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, 8);
+    }
+};
+
 // GGML_OP_MUL_MAT_ID + GGML_OP_ADD or GGML_OP_MUL
 struct test_mul_mat_id_fusion : public test_case {
     const ggml_type type_a;
@@ -11047,6 +11104,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t n_expert_used : { 4, 8, 6 }) {
         for (bool shared_expert : { false, true }) {
             test_cases.emplace_back(new test_moe_sum_residual(256, n_expert_used, shared_expert));
+        }
+    }
+    for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_MXFP4, GGML_TYPE_Q8_0 }) {
+        for (bool experts : { false, true }) {
+            for (bool oai : { false, true }) {
+                test_cases.emplace_back(new test_mul_mat_swiglu(type_a, experts, oai));
+            }
         }
     }
     for (int64_t n_seq_tokens : { 1, 2 }) {
