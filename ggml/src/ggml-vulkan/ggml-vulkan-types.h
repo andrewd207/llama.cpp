@@ -318,6 +318,11 @@ struct vk_command_pool {
 
     vk_queue *q;
 
+    // Pools recording a cached graph: reusable command buffers, submissions captured for replay
+    bool reusable = false;
+    bool replayable = true;
+    std::vector<vk::CommandBuffer> recorded;
+
     size_t buffers_in_use() const {
         return std::count_if(cmd_buffers.begin(), cmd_buffers.end(),
             [](const auto& cb) { return cb.in_use; });
@@ -1220,6 +1225,32 @@ class vk_perf_logger {
     uint32_t print_count {};
 };
 
+// Command buffers and descriptor sets of a recorded graph, resubmitted when an identical graph comes again
+struct vk_graph_cache_entry {
+    int n_nodes;
+    const ggml_tensor * first_node;
+    const ggml_tensor * last_node;
+    std::vector<uint64_t> sig;
+    uint64_t buffer_gen;
+    uint64_t last_used;
+    bool ready = false;
+    vk_command_pool pool;
+    std::vector<vk::DescriptorPool> descriptor_pools;
+    std::vector<vk::DescriptorSet> descriptor_sets;
+    // bindings last written to descriptor_sets, swapped in with them
+    std::vector<std::vector<vk::DescriptorBufferInfo>> descriptor_set_bindings;
+
+    void destroy(vk_device& device) {
+        pool.destroy(device->device);
+        for (auto& dp : descriptor_pools) {
+            device->device.destroyDescriptorPool(dp);
+        }
+        descriptor_pools.clear();
+        descriptor_sets.clear();
+        descriptor_set_bindings.clear();
+    }
+};
+
 struct ggml_backend_vk_context {
     std::string name;
 
@@ -1271,6 +1302,15 @@ struct ggml_backend_vk_context {
 
     vk_command_pool compute_cmd_pool;
     vk_command_pool transfer_cmd_pool;
+
+    std::vector<std::unique_ptr<vk_graph_cache_entry>> graph_cache;
+    // dropped entries, destroyed once the queue is idle
+    std::vector<std::unique_ptr<vk_graph_cache_entry>> graph_cache_retired;
+    uint64_t graph_cache_clock {};
+    // set while recording a graph for the cache
+    vk_command_pool * graph_record_pool {};
+    // a replay ran since the last synchronize
+    bool graph_replayed {};
 
     // number of additional consecutive nodes that are being fused with the
     // node currently being processed
