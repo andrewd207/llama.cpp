@@ -14459,6 +14459,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         if (submit_count < 3) {
             flops_per_submit *= 2;
         }
+        // After the first batch the GPU is busy, so don't pay a ~15 us submit for tiny batches.
+        // Small graphs (e.g. layers between CPU-offloaded experts) otherwise submit almost every node.
+        flops_per_submit = std::max<uint64_t>(flops_per_submit, 100'000'000ULL);
         submit_count++;
     };
 
