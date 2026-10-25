@@ -201,6 +201,10 @@ shared ACC_TYPE coopmat_stage[TM * TN * NUM_WARPS];
 #endif
 
 #include "mul_mm_id_funcs.glsl"
+#ifdef MUL_MAT_ID
+// offset of the gathered B row of each tile column, constant over K
+shared uint row_b_off[BN];
+#endif
 #include "mul_mm_funcs.glsl"
 
 #ifdef MULMAT_QUANT
@@ -290,6 +294,10 @@ void main() {
 
 #ifdef MUL_MAT_ID
     load_row_ids(row_begin);
+    for (uint c = gl_LocalInvocationIndex; c < _ne1; c += BLOCK_SIZE) {
+        row_b_off[c] = row_ids[c].y * p.batch_stride_b + (row_ids[c].x % p.ne11) * p.stride_b;
+    }
+    barrier();
     uint required_work_items = _ne1 * BK / LOAD_VEC_B_EFF / LOAD_VEC_BATCH_B;
     uint required_warp_c = (_ne1 + WN - 1) / WN;
 #endif
@@ -317,7 +325,7 @@ void main() {
 
 #ifdef COOPMAT
     coopmat<FLOAT_TYPE, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> cache_a;
-    coopmat<FLOAT_TYPE, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> cache_b;
+    coopmat<FLOAT_TYPE, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> cache_b[cms_per_col];
     coopmat<ACC_TYPE, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> sums[cms_per_row * cms_per_col];
 
     [[unroll]] for (uint i = 0; i < cms_per_row * cms_per_col; i++) {
@@ -366,14 +374,16 @@ void main() {
         if (warp_c < required_warp_c) {
 #endif
         [[unroll]] for (uint i = 0; i < BK; i += TK) {
+            // B once per k step, reused by every row of the warp tile
+            [[unroll]] for (uint cm_col = 0; cm_col < cms_per_col; cm_col++) {
+                coopMatLoad(cache_b[cm_col], buf_b, (warp_c * WN + cm_col * TN) * SHMEM_STRIDE + i / 2, SHMEM_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+            }
             [[unroll]] for (uint cm_row = 0; cm_row < cms_per_row; cm_row++) {
                 // Load from shared into cache
                 coopMatLoad(cache_a, buf_a, a_shmem_index(warp_r * WM + cm_row * TM, i / 2), a_shmem_stride(), gl_CooperativeMatrixLayoutRowMajor);
 
                 [[unroll]] for (uint cm_col = 0; cm_col < cms_per_col; cm_col++) {
-                    coopMatLoad(cache_b, buf_b, (warp_c * WN + cm_col * TN) * SHMEM_STRIDE + i / 2, SHMEM_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
-
-                    sums[cm_col * cms_per_row + cm_row] = coopMatMulAdd(cache_a, cache_b, sums[cm_col * cms_per_row + cm_row]);
+                    sums[cm_col * cms_per_row + cm_row] = coopMatMulAdd(cache_a, cache_b[cm_col], sums[cm_col * cms_per_row + cm_row]);
                 }
             }
         }
@@ -445,9 +455,11 @@ void main() {
 #ifdef MUL_MAT_ID
     [[unroll]] for (uint cm_row = 0; cm_row < cms_per_row; cm_row++) {
         [[unroll]] for (uint cm_col = 0; cm_col < cms_per_col; cm_col++) {
+            // each warp has its own staging area
             coopMatStore(sums[cm_col * cms_per_row + cm_row], coopmat_stage, warp_i * TM * TN, TM, gl_CooperativeMatrixLayoutColumnMajor);
 
-            barrier();
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
             [[unroll]] for (uint col = 0; col < TN; col += storestride) {
                 const uint row_i = dc + cm_col * TN + col + store_c;
                 if (row_i >= _ne1) break;
@@ -458,7 +470,8 @@ void main() {
                     data_d[row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr + cm_row * TM + store_r] = D_TYPE(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]);
                 }
             }
-            barrier();
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
         }
     }
 #else

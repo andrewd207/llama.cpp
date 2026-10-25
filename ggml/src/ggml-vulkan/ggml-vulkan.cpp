@@ -1308,6 +1308,11 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
     result.block_cols = coopmat_block_cols * num_subgroups;
     result.row_split = num_subgroups;
     result.subgroup_size = device->subgroup_size;
+    if (device->architecture == AMD_RDNA3 && device->subgroup_size_control &&
+        device->subgroup_min_size <= 32 && device->subgroup_max_size >= 32) {
+        // WMMA is native wave32
+        result.subgroup_size = 32;
+    }
     result.workgroup_size = num_subgroups * result.subgroup_size;
 
     const uint32_t D_lsb = D ^ (D & (D-1));  // extract lowest set bit
@@ -1481,7 +1486,8 @@ static bool ggml_vk_matmul_shmem_support(const vk_device& device, const std::vec
     const uint32_t warps = warptile[0] / warptile[10];
 
     const uint32_t load_bufs = (warptile[1] + warptile[2]) * (warptile[3] + bank_conflict_offset) * type_size;
-    const uint32_t mmid_row_ids = mul_mat_id ? (warptile[2] * 2 * sizeof(uint16_t)) : 0;
+    // row_ids and row_b_off
+    const uint32_t mmid_row_ids = mul_mat_id ? (warptile[2] * (2 * sizeof(uint16_t) + sizeof(uint32_t))) : 0;
     const uint32_t coopmat_stage = device->coopmat_support ? warptile[7] * warptile[8] / warps * sizeof(float) : 0;
 
     const uint32_t total_size = load_bufs + mmid_row_ids + coopmat_stage + lut_size;
@@ -1742,6 +1748,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                                 device->subgroup_size_control &&
                                 device->subgroup_min_size <= 32 && device->subgroup_max_size >= 32;
     const uint32_t cm1_sg = cm1_use_wave32 ? 32 : device->subgroup_size;
+    // RDNA3 float coopmat matmul uses a 128x64 medium tile
+    bool mmq_m_tile_128x64 = false;
 
     vk_pipeline wait_pipeline;
     CompileTask claimed_task {};
@@ -1863,6 +1871,15 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             l_warptile = { 256, 128, 128, 16, mm_warp_8, 64, 2, tm_m, tn_m, tk_m, mm_warp_8 };
             l_warptile_mmq = l_warptile_mmq_int = { 256, 128, 128, 32, mm_warp_8, 64, 2, tm_m, tn_m, tk_m, mm_warp_8 };
             l_warptile_mmq_int_k = { 256, 128, 128, 32, mm_warp_16, 64, 1, 4, 2, 1, mm_warp_16 };
+            if (device->architecture == AMD_RDNA3 && cm1_use_wave32) {
+                // WMMA is native wave32, BK 64 halves the shared memory load rounds of the large quant tile
+                l_warptile     = { 256, 128, 128, 16, 64, 32, 2, tm_m, tn_m, tk_m, 32 };
+                m_warptile     = { 128,  64,  64, 16, 32, 32, 2, tm_m, tn_m, tk_m, 32 };
+                s_warptile     = {  32,  32,  32, 16, 32, 32, 2, tm_m, tn_m, tk_m, 32 };
+                l_warptile_mmq = { 256, 128, 128, 64, 64, 32, 2, tm_m, tn_m, tk_m, 32 };
+                m_warptile_mmq = { 128,  64,  64, 32, 32, 32, 2, tm_m, tn_m, tk_m, 32 };
+                s_warptile_mmq = {  32,  32,  32, 32, 32, 32, 2, tm_m, tn_m, tk_m, 32 };
+            }
         } else if (device->vendor_id == VK_VENDOR_ID_QUALCOMM && device->coopmat_support) {
             m_warptile     = { 64, 64, 64, 16, 64, 64, 1, tm_l, tn_l, tk_l, 64 };
             m_warptile_mmq = { 64, 64, 64, 32, 64, 64, 1, tm_m, tn_m, tk_m, 64 };
@@ -1871,6 +1888,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         l_mmq_wg_denoms = l_wg_denoms = {128, 128, 1 };
         m_mmq_wg_denoms = m_wg_denoms = { 64,  64, 1 };
         s_mmq_wg_denoms = s_wg_denoms = { 32,  32, 1 };
+        if (device->architecture == AMD_RDNA3 && cm1_use_wave32 && device->coopmat_support && device->driver_id != vk::DriverId::eAmdProprietary) {
+            // 64x32 warp tiles reuse each B fragment for four rows; the medium tile also carries mul_mat_id
+            m_warptile_mmq = { 128, 128, 64, 32, 64, 32, 2, tm_m, tn_m, tk_m, 32 };
+            mmq_m_tile_128x64 = true;
+        }
         l_align = 128;
         m_align =  64;
         s_align =  32;
@@ -2168,7 +2190,15 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     }
 #endif
 
-    auto const &ggml_vk_mul_mm_spec = [&device](std::vector<uint32_t> spec, bool aligned) {
+    // unaligned variants stay at BK 32, BK 64 was not faster for them (gpt-oss-20b, K 2880)
+    auto const clamp_unaligned_bk = [](std::vector<uint32_t> & spec, bool aligned) {
+        if (!aligned && spec.size() > 3 && spec[3] > 32) {
+            spec[3] = 32;
+        }
+    };
+
+    auto const &ggml_vk_mul_mm_spec = [&device, &clamp_unaligned_bk](std::vector<uint32_t> spec, bool aligned) {
+        clamp_unaligned_bk(spec, aligned);
         spec.push_back(aligned ? 1u : 0u);  // constantID=11: ALIGNED
         if (device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support &&
             device->driver_id == vk::DriverId::eIntelProprietaryWindows) {
@@ -2178,7 +2208,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         return spec;
     };
 
-    auto const &ggml_vk_mul_mm_spec_quant = [&device](std::vector<uint32_t> spec, bool aligned, uint32_t type) {
+    auto const &ggml_vk_mul_mm_spec_quant = [&device, &clamp_unaligned_bk](std::vector<uint32_t> spec, bool aligned, uint32_t type) {
+        clamp_unaligned_bk(spec, aligned);
         spec.push_back(aligned ? 1u : 0u);  // constantID=11: ALIGNED
         spec.push_back(type);               // constantID=12: MmTypeA
         if (device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support &&
@@ -2279,6 +2310,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     std::vector<vk_tile_config> tc_mm = {{s_warptile, s_wg_denoms, s_align}, {m_warptile, m_wg_denoms, m_align}, {l_warptile, l_wg_denoms, l_align}};
     std::vector<vk_tile_config> tc_mmq = {{s_warptile_mmq, s_mmq_wg_denoms, s_align}, {m_warptile_mmq, m_mmq_wg_denoms, m_align}, {l_warptile_mmq, l_mmq_wg_denoms, l_align}};
+    if (mmq_m_tile_128x64) {
+        // the int8 tiles keep the shared 64x64 m_mmq_wg_denoms
+        tc_mmq[1].wg_denoms = { 128, 64, 1 };
+    }
 
 #if defined(VK_NV_cooperative_matrix2) && defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
     if (device->coopmat2) {
@@ -2394,7 +2429,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         spec_fn_t cm1_spec = [&](const std::vector<uint32_t>& wt, bool a) { return ggml_vk_mul_mm_spec(wt, a); };
 
         // Intel coopmat1 pins each pipeline's required subgroup size to its warptile WARP element.
-        const bool cm1_pin = device->vendor_id == VK_VENDOR_ID_INTEL;
+        // RDNA3 does too, its warptiles use wave32.
+        const bool cm1_pin = device->vendor_id == VK_VENDOR_ID_INTEL || (device->architecture == AMD_RDNA3 && cm1_use_wave32);
 
         // Intel coopmat1 uses a dedicated large-tile config for quant matmul_id.
         std::vector<vk_tile_config> tc_mmq_id = tc_mmq;
@@ -2493,7 +2529,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
 #undef X_CM1
 
-        if (device->coopmat_int_support && (rdna3 || rdna4)) {
+        // RDNA3 dense matmul is faster on the wave32 f16 coopmat tiles than on int8 MMQ
+        const bool rdna3_f16_mm = rdna3 && mmq_m_tile_128x64;
+        if (device->coopmat_int_support && ((rdna3 && !rdna3_f16_mm) || rdna4)) {
             cm1_create_mmq({GGML_TYPE_Q4_0,   GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int,   "matmul_q4_0_q8_1",   matmul_q4_0_q8_1_cm1_len,   matmul_q4_0_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3);
             if (!rdna4) { cm1_create_mmq({GGML_TYPE_Q4_1, GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int,   "matmul_q4_1_q8_1",   matmul_q4_1_q8_1_cm1_len,   matmul_q4_1_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3); }
             cm1_create_mmq({GGML_TYPE_Q5_0,   GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int,   "matmul_q5_0_q8_1",   matmul_q5_0_q8_1_cm1_len,   matmul_q5_0_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3);
@@ -2576,9 +2614,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             cm1_create_mmq({GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_1, true, false}, tc_mmq_cm1_int,   "matmul_id_subgroup_iq4_xs_q8_1", matmul_id_subgroup_iq4_xs_q8_1_cm1_len, matmul_id_subgroup_iq4_xs_q8_1_cm1_data, sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count);
             cm1_create_mmq({GGML_TYPE_MXFP4,  GGML_TYPE_Q8_1, true, false}, tc_mmq_cm1_int,   "matmul_id_subgroup_mxfp4_q8_1",  matmul_id_subgroup_mxfp4_q8_1_cm1_len,  matmul_id_subgroup_mxfp4_q8_1_cm1_data,  sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count);
             cm1_create_mmq({GGML_TYPE_Q3_K,   GGML_TYPE_Q8_1, true, false}, tc_mmq_cm1_int_k, "matmul_id_subgroup_q3_k_q8_1",   matmul_id_subgroup_q3_k_q8_1_cm1_len,   matmul_id_subgroup_q3_k_q8_1_cm1_data,   sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count);
-            cm1_create_mmq({GGML_TYPE_Q4_K,   GGML_TYPE_Q8_1, true, false}, tc_mmq_cm1_int,   "matmul_id_subgroup_q4_k_q8_1",   matmul_id_subgroup_q4_k_q8_1_cm1_len,   matmul_id_subgroup_q4_k_q8_1_cm1_data,   sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count);
+            // on RDNA3 the f16 coopmat tiles are also faster for Q4_K and Q6_K MoE (granite 3B MoE pp2048 +4%)
+            if (!rdna3_f16_mm) { cm1_create_mmq({GGML_TYPE_Q4_K,   GGML_TYPE_Q8_1, true, false}, tc_mmq_cm1_int,   "matmul_id_subgroup_q4_k_q8_1",   matmul_id_subgroup_q4_k_q8_1_cm1_len,   matmul_id_subgroup_q4_k_q8_1_cm1_data,   sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count); }
             cm1_create_mmq({GGML_TYPE_Q5_K,   GGML_TYPE_Q8_1, true, false}, tc_mmq_cm1_int,   "matmul_id_subgroup_q5_k_q8_1",   matmul_id_subgroup_q5_k_q8_1_cm1_len,   matmul_id_subgroup_q5_k_q8_1_cm1_data,   sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count);
-            cm1_create_mmq({GGML_TYPE_Q6_K,   GGML_TYPE_Q8_1, true, false}, tc_mmq_cm1_int_k, "matmul_id_subgroup_q6_k_q8_1",   matmul_id_subgroup_q6_k_q8_1_cm1_len,   matmul_id_subgroup_q6_k_q8_1_cm1_data,   sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count);
+            if (!rdna3_f16_mm) { cm1_create_mmq({GGML_TYPE_Q6_K,   GGML_TYPE_Q8_1, true, false}, tc_mmq_cm1_int_k, "matmul_id_subgroup_q6_k_q8_1",   matmul_id_subgroup_q6_k_q8_1_cm1_len,   matmul_id_subgroup_q6_k_q8_1_cm1_data,   sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count); }
             if (!rdna4) { cm1_create_mmq({GGML_TYPE_NVFP4, GGML_TYPE_Q8_1, true, false}, tc_mmq_cm1_int_k, "matmul_id_subgroup_nvfp4_q8_1",  matmul_id_subgroup_nvfp4_q8_1_cm1_len,  matmul_id_subgroup_nvfp4_q8_1_cm1_data,  sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count); }
         }
     } else

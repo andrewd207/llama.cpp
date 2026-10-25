@@ -17,6 +17,12 @@ void store_a(uint m, uint k_pair, FLOAT_TYPEV2 value) {
     buf_a[a_shmem_index(m, k_pair)] = value;
 }
 
+// First K pair of a load row for quants that keep the low and high halves of each 32 value block
+// apart (pairs +0..7 and +8..15). Rows of later blocks in a BK > 32 tile start 16 pairs per block.
+uint split_k_pair(uint row, uint load_vec) {
+    return row * load_vec / 4 + (row / (32 / load_vec)) * 8;
+}
+
 void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uint idx_m, const uint block, const uint end_k) {
 #if defined(DATA_A_F32) || defined(DATA_A_F16)
 #if LOAD_VEC_A == 8
@@ -261,7 +267,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 
 #elif defined(DATA_A_IQ4_XS)
     const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
-    const uint k_pair = row * LOAD_VEC_A / 4;
+    const uint k_pair = split_k_pair(row, LOAD_VEC_A);
 
     const uint ib = idx / 32;
     const uint ib32 = (idx % 32) / 4;
@@ -285,7 +291,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 
 #elif defined(DATA_A_IQ4_NL)
     const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
-    const uint k_pair = row * LOAD_VEC_A / 4;
+    const uint k_pair = split_k_pair(row, LOAD_VEC_A);
 
     const uint ib = idx / 8;
     const uint iqs = idx & 0x07;
@@ -301,7 +307,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 
 #elif defined(DATA_A_MXFP4)
     const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
-    const uint k_pair = row * LOAD_VEC_A / 4;
+    const uint k_pair = split_k_pair(row, LOAD_VEC_A);
 
     const uint ib = idx / 8;
     const uint iqs = (idx & 0x07) * 2;
@@ -348,7 +354,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 #else
     if (MmTypeA == GGML_TYPE_Q4_0) {
         const uint idx = pos_a + col * p.stride_a / mm_load_vec_a() + row;
-        const uint k_pair = row * mm_load_vec_a() / 4;
+        const uint k_pair = split_k_pair(row, mm_load_vec_a());
 
         const uint ib = idx / 4;
         const uint iqs = idx & 0x03;
@@ -364,7 +370,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
         store_a(col, k_pair + 9, FLOAT_TYPEV2(v1.zw));
     } else if (MmTypeA == GGML_TYPE_Q4_1) {
         const uint idx = pos_a + col * p.stride_a / mm_load_vec_a() + row;
-        const uint k_pair = row * mm_load_vec_a() / 4;
+        const uint k_pair = split_k_pair(row, mm_load_vec_a());
 
         const uint ib = idx / 4;
         const uint iqs = idx & 0x03;
@@ -380,7 +386,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
         store_a(col, k_pair + 9, FLOAT_TYPEV2(v1.zw));
     } else if (MmTypeA == GGML_TYPE_Q5_0) {
         const uint idx = pos_a + col * p.stride_a / mm_load_vec_a() + row;
-        const uint k_pair = row * mm_load_vec_a() / 4;
+        const uint k_pair = split_k_pair(row, mm_load_vec_a());
 
         const uint ib = idx / 8;
         const uint iqs = idx & 0x07;
@@ -397,7 +403,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
         store_a(col, k_pair + 8, FLOAT_TYPEV2(v.yw));
     } else if (MmTypeA == GGML_TYPE_Q5_1) {
         const uint idx = pos_a + col * p.stride_a / mm_load_vec_a() + row;
-        const uint k_pair = row * mm_load_vec_a() / 4;
+        const uint k_pair = split_k_pair(row, mm_load_vec_a());
 
         const uint ib = idx / 4;
         const uint iqs = idx & 0x03;
@@ -680,8 +686,7 @@ void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uin
 #if LOAD_VEC_B == 8
     if (ALIGNED != 0) {
         // Not supported for b_type bf16 because bf16mat2x4 does not exist
-        const u16vec2 row_idx = row_ids[col];
-        const uint idx = pos_b + row_idx.y * p.batch_stride_b / LOAD_VEC_B + (row_idx.x % p.ne11) * p.stride_b / LOAD_VEC_B + row;
+        const uint idx = pos_b + row_b_off[col] / LOAD_VEC_B + row;
         const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_B / 2;
         FLOAT_TYPEV8 bb = FLOAT_TYPEV8(data_b[idx]);
         buf_b[buf_idx + 0] = bb[0].xy;
@@ -692,8 +697,7 @@ void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uin
     }
 #elif LOAD_VEC_B == 4
     if (ALIGNED != 0) {
-        const u16vec2 row_idx = row_ids[col];
-        const uint idx = pos_b + row_idx.y * p.batch_stride_b / LOAD_VEC_B + (row_idx.x % p.ne11) * p.stride_b / LOAD_VEC_B + row;
+        const uint idx = pos_b + row_b_off[col] / LOAD_VEC_B + row;
         const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_B / 2;
 #if defined(DATA_B_BF16)
         FLOAT_TYPEV4 bb = FLOAT_TYPEV4(TO_FLOAT_TYPE(data_b[idx]));
@@ -708,13 +712,11 @@ void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uin
     const uint row_i = ic * BN + col;
     const uint buf_idx = col * SHMEM_STRIDE + row;
     if (row_i < _ne1 && block + row * 2 + 1 < end_k) {
-        const u16vec2 row_idx = row_ids[col];
-        const uint idx = pos_b + row_idx.y * p.batch_stride_b + (row_idx.x % p.ne11) * p.stride_b + row * 2;
+        const uint idx = pos_b + row_b_off[col] + row * 2;
         buf_b[buf_idx] = FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b_scalar[idx]),
                                         TO_FLOAT_TYPE(data_b_scalar[idx + 1]));
     } else if (row_i < _ne1 && block + row * 2 < end_k) {
-        const u16vec2 row_idx = row_ids[col];
-        const uint idx = pos_b + row_idx.y * p.batch_stride_b + (row_idx.x % p.ne11) * p.stride_b + row * 2;
+        const uint idx = pos_b + row_b_off[col] + row * 2;
         buf_b[buf_idx] = FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b_scalar[idx]), 0.0f);
     } else {
         buf_b[buf_idx] = FLOAT_TYPEV2(0.0f);
