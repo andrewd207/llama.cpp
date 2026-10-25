@@ -534,7 +534,9 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 #ifdef USE_OCP_FP4
             const float d = e8m0_to_fp32(data_a[ib].e);
 #else
-            const float d = e8m0_to_fp32(data_a[ib].e) * 0.5;
+            // e2m1 code s|eem as the fp16 bits s << 15 | eem << 9 is the value / 2^14, normal or not, so
+            // decode without the shared table. Beyond 2^40 every nonzero value is inf in fp16 anyway.
+            const float d = min(e8m0_to_fp32(data_a[ib].e) * 16384.0, 1099511627776.0);
 #endif
             [[unroll]] for (uint i = 0; i < LOAD_VEC_A / 4; i++) {
                 const uint vui = uint(data_a[ib].qs[iqs + 2 * i]);
@@ -544,8 +546,11 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
                 buf_a[buf_idx + i    ] = FLOAT_TYPEV2(bitcastExtractfe2m1EXT(packed, 0u)) * FLOAT_TYPE(d);
                 buf_a[buf_idx + i + 8] = FLOAT_TYPEV2(bitcastExtractfe2m1EXT(packed, 4u)) * FLOAT_TYPE(d);
 #else
-                buf_a[buf_idx + i    ] = FLOAT_TYPEV2(kvalues_mxfp4[vui  & 0xF] * d, kvalues_mxfp4[vui2 & 0xF] * d);
-                buf_a[buf_idx + i + 8] = FLOAT_TYPEV2(kvalues_mxfp4[vui  >>  4] * d, kvalues_mxfp4[vui2 >>  4] * d);
+                const uint t = vui | (vui2 << 16);
+                const uint lo = ((t & 0x00080008u) << 12) | ((t & 0x00070007u) << 9);
+                const uint hi = ((t & 0x00800080u) << 8) | ((t & 0x00700070u) << 5);
+                buf_a[buf_idx + i    ] = FLOAT_TYPEV2(unpackHalf2x16(lo) * d);
+                buf_a[buf_idx + i + 8] = FLOAT_TYPEV2(unpackHalf2x16(hi) * d);
 #endif
             }
 #elif defined(DATA_A_MXFP4)
@@ -713,8 +718,7 @@ void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uin
 #if LOAD_VEC_B == 8
             if (ALIGNED != 0) {
                 // Not supported for b_type bf16 because bf16mat2x4 does not exist
-                const u16vec2 row_idx = row_ids[col];
-                const uint idx = pos_b + row_idx.y * p.batch_stride_b / LOAD_VEC_B + (row_idx.x % p.ne11) * p.stride_b / LOAD_VEC_B + row;
+                const uint idx = pos_b + row_b_off[col] / LOAD_VEC_B + row;
                 const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_B / 2;
                 FLOAT_TYPEV8 bb = FLOAT_TYPEV8(data_b[idx]);
                 buf_b[buf_idx + 0] = bb[0].xy;
@@ -725,8 +729,7 @@ void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uin
             }
 #elif LOAD_VEC_B == 4
             if (ALIGNED != 0) {
-                const u16vec2 row_idx = row_ids[col];
-                const uint idx = pos_b + row_idx.y * p.batch_stride_b / LOAD_VEC_B + (row_idx.x % p.ne11) * p.stride_b / LOAD_VEC_B + row;
+                const uint idx = pos_b + row_b_off[col] / LOAD_VEC_B + row;
                 const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_B / 2;
 #if defined(DATA_B_BF16)
                 FLOAT_TYPEV4 bb = FLOAT_TYPEV4(TO_FLOAT_TYPE(data_b[idx]));
@@ -741,13 +744,11 @@ void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uin
             const uint row_i = ic * BN + col;
             const uint buf_idx = col * SHMEM_STRIDE + row;
             if (row_i < _ne1 && block + row * 2 + 1 < end_k) {
-                const u16vec2 row_idx = row_ids[col];
-                const uint idx = pos_b + row_idx.y * p.batch_stride_b + (row_idx.x % p.ne11) * p.stride_b + row * 2;
+                const uint idx = pos_b + row_b_off[col] + row * 2;
                 buf_b[buf_idx] = FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b_scalar[idx]),
                                               TO_FLOAT_TYPE(data_b_scalar[idx + 1]));
             } else if (row_i < _ne1 && block + row * 2 < end_k) {
-                const u16vec2 row_idx = row_ids[col];
-                const uint idx = pos_b + row_idx.y * p.batch_stride_b + (row_idx.x % p.ne11) * p.stride_b + row * 2;
+                const uint idx = pos_b + row_b_off[col] + row * 2;
                 buf_b[buf_idx] = FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b_scalar[idx]), 0.0f);
             } else {
                 buf_b[buf_idx] = FLOAT_TYPEV2(0.0f);

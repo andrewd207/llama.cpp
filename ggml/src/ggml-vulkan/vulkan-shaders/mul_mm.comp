@@ -134,6 +134,10 @@ shared ACC_TYPE coopmat_stage[TM * TN * NUM_WARPS];
 #endif
 
 #include "mul_mm_id_funcs.glsl"
+#ifdef MUL_MAT_ID
+// offset of the gathered B row of each tile column, constant over K
+shared uint row_b_off[BN];
+#endif
 #include "mul_mm_funcs.glsl"
 
 void main() {
@@ -235,6 +239,12 @@ void main() {
 
     // Workgroup has no work
     if (ic * BN >= _ne1) return;
+
+    for (uint c = gl_LocalInvocationID.x; c < BN; c += gl_WorkGroupSize.x) {
+        const u16vec2 row_idx = row_ids[c];
+        row_b_off[c] = ic * BN + c < _ne1 ? row_idx.y * p.batch_stride_b + (row_idx.x % p.ne11) * p.stride_b : 0;
+    }
+    barrier();
 #endif
 
 #ifdef MUL_MAT_ID
