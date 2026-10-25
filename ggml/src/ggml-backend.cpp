@@ -1788,6 +1788,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
 
+        // input backends with reads in flight
+        std::vector<ggml_backend_t> read_backends;
+
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
@@ -1899,16 +1902,29 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
-                        ggml_backend_synchronize(input_backend);
                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                         } else {
                             ggml_backend_synchronize(split_backend);
                         }
-                        ggml_backend_tensor_copy(input, input_cpy);
+                        if (input_backend->iface.get_tensor_async && ggml_backend_buffer_is_host(input_cpy->buffer) &&
+                            input->buffer->buft == ggml_backend_get_default_buffer_type(input_backend)) {
+                            // queue the read behind the producing graph, synchronized once for all inputs below
+                            ggml_backend_tensor_get_async(input_backend, input, input_cpy->data, 0, ggml_nbytes(input));
+                            if (std::find(read_backends.begin(), read_backends.end(), input_backend) == read_backends.end()) {
+                                read_backends.push_back(input_backend);
+                            }
+                        } else {
+                            ggml_backend_synchronize(input_backend);
+                            ggml_backend_tensor_copy(input, input_cpy);
+                        }
                     }
                 }
             }
+        }
+
+        for (ggml_backend_t b : read_backends) {
+            ggml_backend_synchronize(b);
         }
 
         if (!sched->callback_eval) {
