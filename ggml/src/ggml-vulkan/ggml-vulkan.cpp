@@ -4188,6 +4188,13 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat2(const vk_device& device
     return result;
 }
 
+// On RDNA3 the scalar path is also faster for up to 8 rows (decode with grouped-query attention)
+// with a quantized K or head size 128, given more split_k workgroups
+static bool ggml_vk_fa_rdna3_scalar_rows(const vk_device& device, uint32_t hsk, uint32_t n_rows, ggml_type k_type) {
+    return device->architecture == vk_device_architecture::AMD_RDNA3 && n_rows <= 8 && hsk <= 256 &&
+           (ggml_is_quantized(k_type) || hsk == 128);
+}
+
 static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type k_type, ggml_type v_type, bool f32acc) {
     FaCodePath path = device->coopmat2 ? FA_COOPMAT2 :
                       device->coopmat1_fa_support ? FA_COOPMAT1 : FA_SCALAR;
@@ -4223,7 +4230,7 @@ static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_
     }
 
     // scalar is faster than coopmat when N==1
-    if (n_rows == 1 && (path == FA_COOPMAT1 || path == FA_COOPMAT2)) {
+    if ((n_rows == 1 || ggml_vk_fa_rdna3_scalar_rows(device, hsk, n_rows, k_type)) && (path == FA_COOPMAT1 || path == FA_COOPMAT2)) {
         path = FA_SCALAR;
     }
 
@@ -11569,7 +11576,9 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
 
     // Try to use split_k when KV is large enough to be worth the overhead.
     if (gqa_ratio > 1 && workgroups_x <= Br) {
-        split_k = shader_core_count * 2 / (workgroups_x * workgroups_y * workgroups_z);
+        // the scalar decode path keeps more KV loads in flight with more workgroups on RDNA3
+        const uint32_t wgs_per_core = tuning_params.path == FA_SCALAR && ggml_vk_fa_rdna3_scalar_rows(ctx->device, HSK, N, k->type) ? 4 : 2;
+        split_k = shader_core_count * wgs_per_core / (workgroups_x * workgroups_y * workgroups_z);
     } else if (gqa_ratio <= 1) {
         uint32_t total_wgs_no_split = Tr * workgroups_y * workgroups_z;
         if (total_wgs_no_split < shader_core_count * 2) {
