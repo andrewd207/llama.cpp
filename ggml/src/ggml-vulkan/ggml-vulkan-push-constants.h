@@ -866,6 +866,14 @@ struct vk_quantize_q8_1_push_constants {
     uint32_t num_blocks;
 };
 
+struct vk_quantize_q8_1_glu_push_constants {
+    uint32_t ne;
+    uint32_t num_blocks;
+    uint32_t glu_op;
+    float alpha;
+    float limit;
+};
+
 struct vk_op_flash_attn_split_k_reduce_push_constants {
     uint32_t D;
     uint32_t ne1;

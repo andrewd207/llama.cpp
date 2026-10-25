@@ -797,6 +797,7 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_matmul_split_k_reduce;
     vk_pipeline pipeline_quantize_q8_1_x4;
+    vk_pipeline pipeline_quantize_q8_1_x4_glu;
 
     vk_pipeline pipeline_dequant[GGML_TYPE_COUNT];
     vk_pipeline pipeline_dequant_transpose[GGML_TYPE_COUNT]; // fused dequant+transpose for FA quant-KV
@@ -1124,6 +1125,16 @@ struct vk_gdn_fusion {
     float scale;
 };
 
+// mat-vec whose src1 is a split swiglu: the q8_1 quantization of src1 computes it from gate and up
+struct vk_glu_quantize {
+    const ggml_tensor * glu;
+    const ggml_tensor * gate;
+    const ggml_tensor * up;
+    uint32_t op;
+    float alpha;
+    float limit;
+};
+
 // mat-vec that also computes the elementwise ops after it and writes the last one's result
 struct vk_mmv_epilogue {
     const ggml_tensor * dst;
@@ -1312,6 +1323,7 @@ struct ggml_backend_vk_context {
     std::vector<bool> fused_away;
     std::unordered_map<const ggml_tensor *, vk_gdn_fusion> gdn_fusions;
     std::unordered_map<const ggml_tensor *, vk_mmv_epilogue> mmv_epilogues;
+    std::unordered_map<const ggml_tensor *, vk_glu_quantize> glu_quantizes;
     // Track which prealloc buffers have pending reads that need to be synchronized.
     // These are checked before writing to the buffer (and call ggml_vk_sync_buffers if set),
     // and set to true after the buffer contents are consumed.

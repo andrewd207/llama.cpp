@@ -16,6 +16,12 @@ layout (push_constant) uniform parameter
 {
     uint ne;
     uint num_blocks;
+#if GLU
+    // 0: swiglu, 1: swiglu_oai
+    uint glu_op;
+    float alpha;
+    float limit;
+#endif
 } p;
 
 #include "types.glsl"
@@ -28,6 +34,21 @@ layout (binding = 0) readonly buffer A {vec4 data_a[];};
 layout (binding = 1) writeonly buffer D {block_q8_1_packed32 data_b[];};
 #else
 layout (binding = 1) writeonly buffer D {block_q8_1_x4 data_b[];};
+#endif
+
+#if GLU
+// the input is glu(data_a, data_u), as swiglu.comp and swiglu_oai.comp compute it in split mode
+layout (binding = 2) readonly buffer U {vec4 data_u[];};
+
+float glu(const float a, const float b) {
+    if (p.glu_op == 0) {
+        return a / (1.0f + exp(-a)) * b;
+    }
+    const float xi = min(a, p.limit);
+    const float gi = max(min(b, p.limit), -p.limit);
+    const float out_glu = xi / (1.0f + exp(-xi * p.alpha));
+    return out_glu * (1.0f + gi);
+}
 #endif
 
 #ifndef USE_SUBGROUPS
@@ -57,7 +78,16 @@ void quantize(const uint wgid) {
 
     const uint a_idx = ib * 8 + iqs;
 
+#if GLU
+    vec4 vals = vec4(0.0f);
+    if (a_idx < p.ne / 4) {
+        const vec4 g = data_a[a_idx];
+        const vec4 u = data_u[a_idx];
+        vals = vec4(glu(g.x, u.x), glu(g.y, u.y), glu(g.z, u.z), glu(g.w, u.w));
+    }
+#else
     vec4 vals = a_idx < p.ne / 4 ? data_a[a_idx] : vec4(0.0f);
+#endif
     const vec4 abs_vals = abs(vals);
 
     // Find absolute max for each block
