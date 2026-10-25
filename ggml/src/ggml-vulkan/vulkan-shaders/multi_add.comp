@@ -20,6 +20,10 @@ layout (push_constant) uniform parameter2
     uint nb[12][4];
 
     uint rms_partials;
+
+    // when nonzero, src 0 holds this many expert outputs, expert_stride apart, that are summed
+    uint expert_count;
+    uint expert_stride;
 } p;
 
 // No readonly/writeonly decorations. Workaround for MoltenVK Bug, see https://github.com/ggml-org/llama.cpp/issues/15498
@@ -128,6 +132,20 @@ uint dst_idx(uint i00, uint i01, uint i02, uint i03) {
     return i03*nb23 + i02*nb22 + i01*nb21 + i00*nb20;
 }
 
+// sum of the experts at src 0 index i, added in the order of the tree in sum_rows.comp
+FLOAT_TYPE sum_experts(uint i) {
+    precise FLOAT_TYPE e[16];
+    [[unroll]] for (uint k = 0; k < 16; ++k) {
+        e[k] = k < p.expert_count ? load_a(0, i + k * p.expert_stride) : FLOAT_TYPE(0);
+    }
+    [[unroll]] for (uint s = 8; s > 0; s >>= 1) {
+        [[unroll]] for (uint k = 0; k < s; ++k) {
+            e[k] = e[k] + e[k + s];
+        }
+    }
+    return e[0];
+}
+
 uint get_idx() {
     return gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
 }
@@ -161,7 +179,11 @@ void main() {
 
         FLOAT_TYPE sum = FLOAT_TYPE(0);
         [[unroll]] for (uint s = 0; s < num_srcs; ++s) {
-            sum += load_a(s, src_idx(s, i00, i01, i02, i03));
+            if (s == 0 && p.expert_count != 0) {
+                sum += sum_experts(src_idx(0, i00, i01, i02, i03));
+            } else {
+                sum += load_a(s, src_idx(s, i00, i01, i02, i03));
+            }
         }
         sum_sq += sum*sum;
         store_d(num_srcs, dst_idx(i00, i01, i02, i03), sum);

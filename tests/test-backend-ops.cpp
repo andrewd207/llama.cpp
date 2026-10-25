@@ -4726,6 +4726,46 @@ struct test_gated_delta_net_layer : public test_case {
     }
 };
 
+// MoE output for one token: experts summed with permute + cont + sum_rows (build_moe_ffn),
+// plus an optional shared expert scaled by its gate, plus the residual
+struct test_moe_sum_residual : public test_case {
+    const int64_t n_embd;
+    const int64_t n_expert_used;
+    const bool shared_expert;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_SUM_RESIDUAL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, n_expert_used, shared_expert);
+    }
+
+    test_moe_sum_residual(int64_t n_embd = 256, int64_t n_expert_used = 8, bool shared_expert = true)
+        : n_embd(n_embd), n_expert_used(n_expert_used), shared_expert(shared_expert) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_ff = 128;
+        ggml_tensor * experts  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_expert_used, 1);
+        ggml_tensor * residual = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, 1);
+
+        ggml_tensor * sum = ggml_sum_rows(ctx, ggml_cont(ctx, ggml_permute(ctx, experts, 1, 0, 2, 3)));
+        ggml_tensor * out = ggml_reshape_2d(ctx, sum, n_embd, 1);
+        if (shared_expert) {
+            ggml_tensor * x      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_ff, 1);
+            ggml_tensor * w_down = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_ff, n_embd);
+            ggml_tensor * gate   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, 1);
+            out = ggml_add(ctx, out, ggml_mul(ctx, ggml_mul_mat(ctx, w_down, x), gate));
+        }
+        out = ggml_add(ctx, out, residual);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_GATED_LINEAR_ATTN
 struct test_gla : public test_case {
     const ggml_type type;
@@ -11004,6 +11044,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
+    for (int64_t n_expert_used : { 4, 8, 6 }) {
+        for (bool shared_expert : { false, true }) {
+            test_cases.emplace_back(new test_moe_sum_residual(256, n_expert_used, shared_expert));
+        }
+    }
     for (int64_t n_seq_tokens : { 1, 2 }) {
         test_cases.emplace_back(new test_gated_delta_net_layer(4, 2, 64, n_seq_tokens, 256));
         test_cases.emplace_back(new test_gated_delta_net_layer(32, 16, 128, n_seq_tokens, 512));

@@ -1314,6 +1314,7 @@ struct vk_mat_mat_push_constants {
 #define MAT_VEC_FUSION_FLAGS_SCALE1 0x8
 #define MAT_VEC_FUSION_FLAGS_SOFTPLUS_SCALE1 0x10
 #define MAT_VEC_FUSION_FLAGS_SIGMOID 0x20
+#define MAT_VEC_FUSION_FLAGS_SCALE1_BCAST 0x40
 
 struct vk_mat_vec_push_constants {
     uint32_t ncols;
@@ -1643,6 +1644,10 @@ struct vk_op_multi_add_push_constants {
     uint32_t nb[MAX_PARAMETER_COUNT][4];
 
     uint32_t rms_partials;
+
+    // when nonzero, src 0 holds this many expert outputs, expert_stride apart, that are summed
+    uint32_t expert_count;
+    uint32_t expert_stride;
 };
 // update multi_add.comp if this changes
 static_assert(MAX_PARAMETER_COUNT == 12);
@@ -1898,6 +1903,12 @@ struct vk_gdn_fusion {
     const ggml_tensor * q;
     const ggml_tensor * k;
     float eps;
+};
+
+// ADD whose operand sums the experts of a MoE layer (cont of the permuted outputs, then sum_rows)
+struct vk_moe_sum {
+    const ggml_tensor * experts;
+    const ggml_tensor * sum;
 };
 
 // mat-vec that also computes the elementwise ops after it and writes the last one's result
@@ -2645,6 +2656,9 @@ struct ggml_backend_vk_context {
     std::vector<bool> fused_away;
     std::unordered_map<const ggml_tensor *, vk_gdn_fusion> gdn_fusions;
     std::unordered_map<const ggml_tensor *, vk_mmv_epilogue> mmv_epilogues;
+    std::unordered_map<const ggml_tensor *, vk_moe_sum> moe_sums;
+    // the current ADD sums experts, so it runs as a multi_add
+    bool fused_moe_sum {};
     // Track which prealloc buffers have pending reads that need to be synchronized.
     // These are checked before writing to the buffer (and call ggml_vk_sync_buffers if set),
     // and set to true after the buffer contents are consumed.
@@ -11730,7 +11744,7 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         switch (op) {
         case GGML_OP_ADD:
         {
-            if (ctx->num_additional_fused_ops > 0) {
+            if (ctx->num_additional_fused_ops > 0 || ctx->fused_moe_sum) {
                 if (ctx->do_add_rms_partials) {
                     return ctx->device->pipeline_multi_add_rms[ctx->num_additional_fused_ops];
                 } else {
@@ -12978,6 +12992,19 @@ static void ggml_vk_multi_add(ggml_backend_vk_context * ctx, vk_context& subctx,
     }
     tensors[num_srcs] = dst;
 
+    uint32_t expert_count = 0, expert_stride = 0;
+    if (ctx->fused_moe_sum) {
+        // the sum goes first, adds are exact in either order
+        const vk_moe_sum & ms = ctx->moe_sums.at(first_node);
+        if (tensors[1] == ms.sum) {
+            std::swap(tensors[0], tensors[1]);
+        }
+        GGML_ASSERT(tensors[0] == ms.sum);
+        tensors[0] = ms.experts;
+        expert_count = (uint32_t)ms.experts->ne[1];
+        expert_stride = (uint32_t)(ms.experts->nb[1] / sizeof(float));
+    }
+
     vk_op_multi_add_push_constants pc;
     pc.ne20 = (uint32_t)dst->ne[0];
     pc.ne21 = (uint32_t)dst->ne[1];
@@ -12991,7 +13018,16 @@ static void ggml_vk_multi_add(ggml_backend_vk_context * ctx, vk_context& subctx,
         pc.nb[i][2] = (uint32_t)t->nb[2] / sizeof(float);
         pc.nb[i][3] = (uint32_t)t->nb[3] / sizeof(float);
     }
+    if (expert_count) {
+        // experts are [n_embd, n_expert_used, n_tokens], indexed like dst [n_embd, n_tokens]
+        const ggml_tensor *t = tensors[0];
+        pc.nb[0][1] = (uint32_t)(t->nb[2] / sizeof(float));
+        pc.nb[0][2] = (uint32_t)(t->nb[3] / sizeof(float));
+        pc.nb[0][3] = 0;
+    }
     pc.rms_partials = ctx->do_add_rms_partials;
+    pc.expert_count = expert_count;
+    pc.expert_stride = expert_stride;
 
     vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, tensors[0], tensors[1], nullptr, dst, dst->op);
 
@@ -15937,7 +15973,14 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
             auto it = ctx->mmv_epilogues.find(node);
             if (it != ctx->mmv_epilogues.end()) {
                 fused_dst = it->second.dst;
+                for (const ggml_tensor * t : { it->second.fuse0, it->second.fuse1 }) {
+                    if (t) {
+                        fused_srcs.push_back(t);
+                    }
+                }
             }
+        } else if (ctx->fused_moe_sum) {
+            fused_srcs = { ctx->moe_sums.at(node).experts };
         }
         for (const ggml_tensor * t : fused_srcs) {
             need_sync = need_sync || overlaps_unsynced(t, ctx->unsynced_nodes_written);
@@ -16036,7 +16079,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
     case GGML_OP_ADD:
-        if (ctx->num_additional_fused_ops) {
+        if (ctx->num_additional_fused_ops || ctx->fused_moe_sum) {
             ggml_vk_multi_add(ctx, compute_ctx, cgraph, node_idx);
         } else {
             ggml_vk_add(ctx, compute_ctx, src0, src1, node);
@@ -17899,21 +17942,40 @@ static void ggml_vk_find_mmv_epilogue(ggml_backend_vk_context * ctx, ggml_cgraph
         idxs.push_back(j);
         return cgraph->nodes[j];
     };
-    // the other src of a binary op, a weight with one value per row
-    auto weight = [&](const ggml_tensor * op) -> const ggml_tensor * {
+    // the output of an earlier mat-vec's epilogue, which that mat-vec writes
+    auto written_before = [&](const ggml_tensor * v) {
+        for (const auto & it : ctx->mmv_epilogues) {
+            if (it.second.dst == v) {
+                return true;
+            }
+        }
+        return false;
+    };
+    // the other src of a binary op with ne values, computed before the mat-vec (it is read there)
+    auto operand = [&](const ggml_tensor * op, int64_t ne) -> const ggml_tensor * {
         const ggml_tensor * w = op->src[0] == cgraph->nodes[idxs[idxs.size() - 2]] ? op->src[1] : op->src[0];
-        return w->op == GGML_OP_NONE && w->type == GGML_TYPE_F32 && ggml_nelements(w) == n && ggml_is_contiguous(w) &&
-               w->buffer && get_misalign_bytes(ctx, w) == 0 ? w : nullptr;
+        if (w->type != GGML_TYPE_F32 || ggml_nelements(w) != ne || !ggml_is_contiguous(w) || !w->buffer ||
+            get_misalign_bytes(ctx, w) != 0) {
+            return nullptr;
+        }
+        for (int j = m; j < idxs.back(); j++) {
+            for (const ggml_tensor * v = w; v; v = v->view_src) {
+                if (cgraph->nodes[j] == v && !written_before(v)) {
+                    return nullptr;
+                }
+            }
+        }
+        return w;
     };
 
     vk_mmv_epilogue e {};
     const ggml_tensor * t = next(GGML_OP_ADD);
     if (t) {
         const ggml_tensor * add = t;
-        e.fuse0 = weight(add);
+        e.fuse0 = operand(add, n);
         const ggml_tensor * sp = e.fuse0 ? next(GGML_OP_UNARY) : nullptr;
         const ggml_tensor * mul = sp && ggml_get_unary_op(sp) == GGML_UNARY_OP_SOFTPLUS ? next(GGML_OP_MUL) : nullptr;
-        e.fuse1 = mul ? weight(mul) : nullptr;
+        e.fuse1 = mul ? operand(mul, n) : nullptr;
         if (!e.fuse1) {
             return;
         }
@@ -17922,11 +17984,20 @@ static void ggml_vk_find_mmv_epilogue(ggml_backend_vk_context * ctx, ggml_cgraph
     } else {
         idxs.resize(1);
         t = next(GGML_OP_UNARY);
-        if (!t || ggml_get_unary_op(t) != GGML_UNARY_OP_SIGMOID) {
-            return;
+        if (t && ggml_get_unary_op(t) == GGML_UNARY_OP_SIGMOID) {
+            e.dst = t;
+            e.flags = MAT_VEC_FUSION_FLAGS_SIGMOID;
+        } else {
+            // times a single value, e.g. the sigmoid gate of a shared expert
+            idxs.resize(1);
+            t = next(GGML_OP_MUL);
+            e.fuse1 = t ? operand(t, 1) : nullptr;
+            if (!e.fuse1) {
+                return;
+            }
+            e.dst = t;
+            e.flags = MAT_VEC_FUSION_FLAGS_SCALE1_BCAST;
         }
-        e.dst = t;
-        e.flags = MAT_VEC_FUSION_FLAGS_SIGMOID;
     }
 
     // e.dst is written at m instead of at its own node, so nothing in between may use its memory
@@ -17942,9 +18013,55 @@ static void ggml_vk_find_mmv_epilogue(ggml_backend_vk_context * ctx, ggml_cgraph
     ctx->mmv_epilogues[mm] = e;
 }
 
+// An ADD that adds the sum of a MoE layer's experts reads the experts directly, instead of a
+// cont of them permuted and a sum_rows (see build_moe_ffn for n_tokens == 1)
+static void ggml_vk_find_moe_sum(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, int a) {
+    ggml_tensor * add = cgraph->nodes[a];
+    for (int s = 0; s < 2; s++) {
+        const ggml_tensor * sum = add->src[s];
+        const ggml_tensor * rows = sum->op == GGML_OP_RESHAPE ? sum->src[0] : sum;
+        if (rows->op != GGML_OP_SUM_ROWS || rows->src[0]->op != GGML_OP_CONT || rows->src[0]->src[0]->op != GGML_OP_PERMUTE) {
+            continue;
+        }
+        const ggml_tensor * cont = rows->src[0];
+        const ggml_tensor * perm = cont->src[0];
+        const ggml_tensor * experts = perm->src[0];
+        const int32_t * axes = (const int32_t *) perm->op_params;
+        // one token, experts summed in the order of sum_rows.comp (a tree over up to 16 values)
+        if (axes[0] != 1 || axes[1] != 0 || axes[2] != 2 || axes[3] != 3 || experts->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(experts) || experts->ne[2] != 1 || experts->ne[3] != 1 ||
+            experts->ne[1] > 16 || experts->ne[1] > ctx->device->subgroup_size ||
+            ggml_nelements(sum) != experts->ne[0] || !experts->buffer || get_misalign_bytes(ctx, experts) != 0) {
+            continue;
+        }
+        std::vector<int> idxs;
+        for (int j = std::max(0, a - vk_deferred_fusion_window); j < a; j++) {
+            const ggml_tensor * node = cgraph->nodes[j];
+            if (node == cont || node == rows || (node == sum && sum != rows)) {
+                idxs.push_back(j);
+            }
+        }
+        idxs.push_back(a);
+        if (idxs.size() != (sum != rows ? 4u : 3u) || !ggml_vk_fuse_subgraph(cgraph, idxs)) {
+            continue;
+        }
+        // nothing up to the last add of the multi_add may overwrite the experts
+        const int last = a + (int)std::max(1u, ggml_vk_fuse_multi_add(ctx, cgraph, a)) - 1;
+        if (ggml_vk_nodes_use(cgraph, idxs[0], last, std::vector<int>(idxs.begin(), idxs.end() - 1), experts, false)) {
+            continue;
+        }
+        for (size_t i = 0; i + 1 < idxs.size(); i++) {
+            ctx->fused_away[idxs[i]] = true;
+        }
+        ctx->moe_sums[add] = { experts, sum };
+        return;
+    }
+}
+
 static void ggml_vk_find_deferred_fusions(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph) {
     ctx->gdn_fusions.clear();
     ctx->mmv_epilogues.clear();
+    ctx->moe_sums.clear();
     ctx->fused_away.clear();
 #ifdef GGML_VULKAN_CHECK_RESULTS
     return;
@@ -17955,7 +18072,7 @@ static void ggml_vk_find_deferred_fusions(ggml_backend_vk_context * ctx, ggml_cg
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
         if (!(node->flags & GGML_TENSOR_FLAG_COMPUTE) ||
-            (node->op != GGML_OP_GATED_DELTA_NET && node->op != GGML_OP_MUL_MAT) ||
+            (node->op != GGML_OP_GATED_DELTA_NET && node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_ADD) ||
             (!ctx->fused_away.empty() && ctx->fused_away[i])) {
             continue;
         }
@@ -17964,6 +18081,8 @@ static void ggml_vk_find_deferred_fusions(ggml_backend_vk_context * ctx, ggml_cg
         }
         if (node->op == GGML_OP_MUL_MAT) {
             ggml_vk_find_mmv_epilogue(ctx, cgraph, i);
+        } else if (node->op == GGML_OP_ADD) {
+            ggml_vk_find_moe_sum(ctx, cgraph, i);
         } else {
             ggml_vk_find_gdn_l2_norm(ctx, cgraph, i);
         }
@@ -18219,6 +18338,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
         ctx->fused_topk_moe_scale = false;
+        ctx->fused_moe_sum = cgraph->nodes[i]->op == GGML_OP_ADD && ctx->moe_sums.count(cgraph->nodes[i]);
         const char *fusion_string {};
         // nodes in a non-adjacent fusion don't start an adjacent one
         auto const &deferred = [&](int idx) {
@@ -18226,6 +18346,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         };
         if (!ctx->device->disable_fusion && !deferred(i)) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
+            if (!num_adds && ctx->fused_moe_sum) {
+                num_adds = 1;
+            }
             if (num_adds) {
                 ctx->num_additional_fused_ops = num_adds - 1;
                 fusion_string = "MULTI_ADD";
