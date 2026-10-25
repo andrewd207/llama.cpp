@@ -369,9 +369,11 @@ void main() {
 #ifdef MUL_MAT_ID
     [[unroll]] for (uint cm_row = 0; cm_row < cms_per_row; cm_row++) {
         [[unroll]] for (uint cm_col = 0; cm_col < cms_per_col; cm_col++) {
+            // each warp has its own staging area
             coopMatStore(sums[cm_col * cms_per_row + cm_row], coopmat_stage, warp_i * TM * TN, TM, gl_CooperativeMatrixLayoutColumnMajor);
 
-            barrier();
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
             [[unroll]] for (uint col = 0; col < TN; col += storestride) {
                 const uint row_i = dc + cm_col * TN + col + store_c;
                 if (row_i >= _ne1) break;
@@ -382,7 +384,8 @@ void main() {
                     data_d[row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr + cm_row * TM + store_r] = D_TYPE(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]);
                 }
             }
-            barrier();
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
         }
     }
 #else
