@@ -169,7 +169,33 @@ FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
     // 16 quants per call => divide sums by 32/16 = 2
     return mul_q8_1(q_sum, get_dm(ib_a), cache_b_ds, 2);
 }
-#elif defined(DATA_A_QUANT_LEGACY) || defined(DATA_A_MXFP4)
+#elif defined(DATA_A_MXFP4)
+layout (binding = 0) readonly buffer A_U32 {uint32_t data_a_u32[];};
+
+// 16 quants, bytes 8 * iqs to 8 * iqs + 7 of the block's qs, read as dwords (blocks are 17 bytes)
+FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
+    const uint byte0 = ib_a * 17 + 1 + iqs * 8;
+    const uint w = byte0 / 4;
+    const uint sh = (byte0 % 4) * 8;
+    const uint32_t d0 = data_a_u32[w];
+    const uint32_t d1 = data_a_u32[w + 1];
+    const uint32_t d2 = sh != 0 ? data_a_u32[w + 2] : 0;
+    const uint32_t q0 = sh != 0 ? (d0 >> sh) | (d1 << (32 - sh)) : d0;
+    const uint32_t q1 = sh != 0 ? (d1 >> sh) | (d2 << (32 - sh)) : d1;
+
+    int32_t q_sum = 0;
+    [[unroll]] for (uint c = 0; c < 2; c++) {
+        const uint32_t qs = c == 0 ? q0 : q1;
+        const u8vec4 i_a0 = unpack8( qs       & 0x0F0F0F0F);
+        const u8vec4 i_a1 = unpack8((qs >> 4) & 0x0F0F0F0F);
+        q_sum += dotPacked4x8EXT(pack32(i8vec4(kvalues_mxfp4[i_a0.x], kvalues_mxfp4[i_a0.y], kvalues_mxfp4[i_a0.z], kvalues_mxfp4[i_a0.w])),
+                                 cache_b_qs[c]);
+        q_sum += dotPacked4x8EXT(pack32(i8vec4(kvalues_mxfp4[i_a1.x], kvalues_mxfp4[i_a1.y], kvalues_mxfp4[i_a1.z], kvalues_mxfp4[i_a1.w])),
+                                 cache_b_qs[c + 2]);
+    }
+    return mul_q8_1(q_sum, get_dm(ib_a), cache_b_ds, 1);
+}
+#elif defined(DATA_A_QUANT_LEGACY)
 FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
     int32_t q_sum = 0;
 #if QUANT_R == 2
