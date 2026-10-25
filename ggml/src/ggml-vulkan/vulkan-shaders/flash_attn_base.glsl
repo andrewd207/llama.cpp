@@ -152,6 +152,7 @@ uint32_t i, N, KV, split_k_index, Tr, start_j, end_j,
 
 void init_indices()
 {
+    uint wg_iq2 = gl_WorkGroupID.y;
     N = p.N;
     KV = p.KV;
 
@@ -171,7 +172,11 @@ void init_indices()
         gqa_iq1 = gl_WorkGroupID.x;
         split_k_index = 0;
     } else {
-        i = gl_WorkGroupID.x;
+        // consecutive workgroups take different heads, so they read different KV rows
+        // (an interleaved KV cache otherwise sends them all to the same memory channels)
+        const uint lin = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+        i = lin / gl_NumWorkGroups.y;
+        wg_iq2 = lin % gl_NumWorkGroups.y;
         gqa_iq1 = 0;
         split_k_index = 0;
     }
@@ -183,7 +188,7 @@ void init_indices()
 
     // When not using grouped query attention, all rows share the same iq2, equal to gl_WorkGroupID.y.
     // When using grouped query attention, each workgroup does gqa_ratio consecutive values of iq2.
-    iq2 = gl_WorkGroupID.y * p.gqa_ratio;
+    iq2 = wg_iq2 * p.gqa_ratio;
     iq3 = gl_WorkGroupID.z;
 
     // broadcast factors
