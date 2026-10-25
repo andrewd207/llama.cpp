@@ -108,6 +108,7 @@ static std::vector<ggml_moe_cache_api> ggml_moe_cache_provider_candidates(
 #include <string.h>
 #include <algorithm>
 #include <mutex>
+#include <unordered_set>
 #include <vector>
 
 #ifdef __APPLE__
@@ -922,6 +923,10 @@ struct ggml_backend_sched_split {
     int inputs_capacity;
     // graph view of this split
     struct ggml_cgraph graph;
+    // the first n_prefix nodes compute the inputs of the next split, which runs on another backend
+    int n_prefix;
+    uint64_t uid_prefix;
+    uint64_t uid_suffix;
 };
 
 struct ggml_backend_sched {
@@ -958,6 +963,8 @@ struct ggml_backend_sched {
     int cur_copy;
     int next_copy;
     ggml_backend_event_t events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
+    // signals the reads of the next split's inputs that are queued in the middle of a split
+    ggml_backend_event_t prefetch_events[GGML_SCHED_MAX_BACKENDS];
     struct ggml_tensor ** graph_inputs;
     int n_graph_inputs;
     int graph_inputs_capacity;
@@ -1205,6 +1212,76 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
         *node_backend_id = cur_backend_id;
         SET_CAUSE(node, "2.sup");
     }
+}
+
+// The tensor whose memory t uses
+static const struct ggml_tensor * ggml_backend_sched_base(const struct ggml_tensor * t) {
+    while (t->view_src) {
+        t = t->view_src;
+    }
+    return t;
+}
+
+// Moves the nodes of a split that compute the inputs of the next split to the front, keeping their
+// order, so the next split (on another backend) can start while the rest of this split computes.
+// Nodes that write memory a moved node reads, or read memory it writes, are moved too, since these
+// dependencies (e.g. a KV cache write and the attention reading it) are not srcs.
+// Returns the number of moved nodes, or 0 if nothing would be left to overlap.
+static int ggml_backend_sched_order_next_inputs_first(struct ggml_cgraph * graph, const struct ggml_backend_sched_split * next) {
+    const int n = graph->n_nodes;
+    std::vector<bool> needed(n, false);
+    std::unordered_set<const struct ggml_tensor *> wanted(next->inputs, next->inputs + next->n_inputs);
+    // memory read and written by the needed nodes after the current one
+    std::unordered_set<const struct ggml_tensor *> needed_reads;
+    std::unordered_set<const struct ggml_tensor *> needed_writes;
+
+    // srcs come before their users, so one backward pass sees every later needed node
+    int n_needed = 0;
+    bool rest_computes = false;
+    for (int j = n - 1; j >= 0; j--) {
+        struct ggml_tensor * node = graph->nodes[j];
+        const bool writes = !ggml_op_is_empty(node->op);
+        const struct ggml_tensor * base = ggml_backend_sched_base(node);
+
+        bool want = wanted.count(node) != 0 ||
+                    (writes && (needed_reads.count(base) != 0 || needed_writes.count(base) != 0));
+        for (int s = 0; s < GGML_MAX_SRC && !want; s++) {
+            want = node->src[s] && needed_writes.count(ggml_backend_sched_base(node->src[s])) != 0;
+        }
+        if (!want) {
+            rest_computes = rest_computes || writes;
+            continue;
+        }
+
+        needed[j] = true;
+        n_needed++;
+        if (writes) {
+            needed_writes.insert(base);
+        }
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            if (node->src[s]) {
+                wanted.insert(node->src[s]);
+                needed_reads.insert(ggml_backend_sched_base(node->src[s]));
+            }
+        }
+        if (node->view_src) {
+            wanted.insert(node->view_src);
+        }
+    }
+    if (n_needed == 0 || !rest_computes) {
+        return 0;
+    }
+
+    std::vector<struct ggml_tensor *> order;
+    for (int pass = 0; pass < 2; pass++) {
+        for (int j = 0; j < n; j++) {
+            if (needed[j] == (pass == 0)) {
+                order.push_back(graph->nodes[j]);
+            }
+        }
+    }
+    std::copy(order.begin(), order.end(), graph->nodes);
+    return n_needed;
 }
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
@@ -1625,6 +1702,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         // so they are in sync.
         ggml_backend_graph_optimize(sched->backends[split->backend_id], &split->graph);
 
+        split->n_prefix = 0;
+        if (i + 1 < sched->n_splits && sched->splits[i + 1].backend_id != split->backend_id) {
+            split->n_prefix = ggml_backend_sched_order_next_inputs_first(&split->graph, &sched->splits[i + 1]);
+        }
+
         // add inputs to the graph copy so that they are allocated by ggml-alloc at the start of the split
         for (int j = 0; j < split->n_inputs; j++) {
             assert(graph_copy->size > (graph_copy->n_nodes + 1));
@@ -1692,6 +1774,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     // set ids for all splits
     for (int i = 0; i < sched->n_splits; ++i) {
         sched->splits[i].graph.uid = ggml_graph_next_uid();
+        sched->splits[i].uid_prefix = ggml_graph_next_uid();
+        sched->splits[i].uid_suffix = ggml_graph_next_uid();
     }
 }
 
@@ -1747,6 +1831,35 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+// The inputs of split next_id can be read back while the rest of the split before it computes:
+// all of them are made by that split's backend and read asynchronously into its pinned host memory,
+// which an event can wait for.
+static bool ggml_backend_sched_can_prefetch(ggml_backend_sched_t sched, int next_id) {
+    if (next_id >= sched->n_splits || sched->n_copies != 1 || sched->callback_eval) {
+        return false;
+    }
+    const struct ggml_backend_sched_split * split = &sched->splits[next_id - 1];
+    const struct ggml_backend_sched_split * next = &sched->splits[next_id];
+    ggml_backend_t backend = sched->backends[split->backend_id];
+    ggml_backend_t next_backend = sched->backends[next->backend_id];
+    ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend));
+    if (split->n_prefix == 0 || !backend->iface.get_tensor_async || next_backend->iface.cpy_tensor_async || !host_buft) {
+        return false;
+    }
+    for (int i = 0; i < next->n_inputs; i++) {
+        struct ggml_tensor * input = next->inputs[i];
+        struct ggml_tensor * input_cpy = tensor_copy(input, next->backend_id, sched->cur_copy);
+        if ((input->flags & GGML_TENSOR_FLAG_INPUT) || ggml_backend_sched_get_tensor_backend(sched, input) != backend ||
+            input->buffer->buft != ggml_backend_get_default_buffer_type(backend) || input_cpy->buffer->buft != host_buft) {
+            return false;
+        }
+    }
+    if (!sched->prefetch_events[split->backend_id]) {
+        sched->prefetch_events[split->backend_id] = ggml_backend_event_new(ggml_backend_get_device(backend));
+    }
+    return sched->prefetch_events[split->backend_id] != nullptr;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1783,6 +1896,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
 
+    // the inputs of the current split were read while the previous one computed
+    ggml_backend_event_t inputs_prefetched = nullptr;
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
@@ -1791,8 +1907,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // input backends with reads in flight
         std::vector<ggml_backend_t> read_backends;
 
+        if (inputs_prefetched) {
+            ggml_backend_event_synchronize(inputs_prefetched);
+        }
+
         // copy the input tensors to the split backend
-        for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+        for (int input_id = 0; input_id < (inputs_prefetched ? 0 : split->n_inputs); input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
@@ -1927,7 +2047,34 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             ggml_backend_synchronize(b);
         }
 
-        if (!sched->callback_eval) {
+        inputs_prefetched = nullptr;
+
+        if (ggml_backend_sched_can_prefetch(sched, split_id + 1)) {
+            // compute the inputs of the next split, read them back, then compute the rest of this
+            // split while the next one runs
+            struct ggml_cgraph gv = ggml_graph_view(&split->graph, 0, split->n_prefix);
+            gv.uid = split->uid_prefix;
+            enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
+            if (ec != GGML_STATUS_SUCCESS) {
+                return ec;
+            }
+            const struct ggml_backend_sched_split * next = &splits[split_id + 1];
+            ggml_backend_synchronize(sched->backends[next->backend_id]);
+            for (int input_id = 0; input_id < next->n_inputs; input_id++) {
+                struct ggml_tensor * input = next->inputs[input_id];
+                struct ggml_tensor * input_cpy = tensor_copy(input, next->backend_id, sched->cur_copy);
+                ggml_backend_tensor_get_async(split_backend, input, input_cpy->data, 0, ggml_nbytes(input));
+            }
+            inputs_prefetched = sched->prefetch_events[split_backend_id];
+            ggml_backend_event_record(inputs_prefetched, split_backend);
+
+            gv = ggml_graph_view(&split->graph, split->n_prefix, split->graph.n_nodes);
+            gv.uid = split->uid_suffix;
+            ec = ggml_backend_graph_compute_async(split_backend, &gv);
+            if (ec != GGML_STATUS_SUCCESS) {
+                return ec;
+            }
+        } else if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
@@ -2122,6 +2269,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
         }
+        ggml_backend_event_free(sched->prefetch_events[b]);
     }
     ggml_gallocr_free(sched->galloc);
     ggml_free(sched->ctx);
