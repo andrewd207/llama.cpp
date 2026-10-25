@@ -12755,7 +12755,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
 
     // gpt-oss-20b
-    for (int bs : {1, 4, 8, 512}) {
+    for (int bs : {1, 4, 8, 512, 1024, 2048}) {
         for (ggml_type type_a : {GGML_TYPE_MXFP4}) {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
                 test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 32, 4, false, 2880, bs, 2880));
