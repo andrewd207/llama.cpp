@@ -536,6 +536,8 @@ static constexpr std::initializer_list<std::array<int, 3>> topk_qsa_edges {
 static constexpr std::initializer_list<ggml_op> rms_norm_mul_add_mul_pattern { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_MUL };
 
 static constexpr std::initializer_list<ggml_op> rms_norm_mul_add_pattern     { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD };
+// rms_norm(x) * w * silu(gate), the gated norm of linear attention layers
+static constexpr std::initializer_list<ggml_op> rms_norm_mul_silu_mul_pattern { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL };
 
 static constexpr std::initializer_list<ggml_op> rms_norm_mul_rope_view_set_rows_pattern { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS };
 
@@ -626,6 +628,7 @@ enum rms_norm_mode {
     RMS_NORM_MUL,
     RMS_NORM_MUL_ADD,
     RMS_NORM_MUL_ADD_MUL,
+    RMS_NORM_MUL_SILU_MUL,
     RMS_NORM_MUL_ROPE,
     RMS_NORM_MUL_ROPE_VIEW_SET_ROWS,
     RMS_NORM_VIEW_SET_ROWS,
@@ -855,6 +858,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_group_norm_f32;
     vk_pipeline pipeline_rms_norm_f32;
     vk_pipeline pipeline_rms_norm_mul_f32;
+    vk_pipeline pipeline_rms_norm_mul_gate_f32;
     vk_pipeline pipeline_rms_norm_mul_add_f32;
     vk_pipeline pipeline_rms_norm_mul_add_mul_f32;
     vk_pipeline pipeline_rms_norm_mul_add_partials_f32;
@@ -972,6 +976,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_lightning_indexer_f32[GGML_TYPE_COUNT];
     // [size_idx][kda] where size_idx: 0=d16, 1=d32, 2=d64, 3=d128
     vk_pipeline pipeline_gated_delta_net[4][2];
+    // [size_idx], q and k normalized in the shader
+    vk_pipeline pipeline_gated_delta_net_qkn[4];
     vk_pipeline pipeline_ssm_scan_f32_d128;
     vk_pipeline pipeline_ssm_scan_f32_d256;
     vk_pipeline pipeline_ssm_conv_f32;
@@ -1103,6 +1109,26 @@ typedef std::vector<vk_submission> vk_sequence;
 #define MAT_VEC_FUSION_FLAGS_SCALE0 0x4
 
 #define MAT_VEC_FUSION_FLAGS_SCALE1 0x8
+
+#define MAT_VEC_FUSION_FLAGS_SOFTPLUS_SCALE1 0x10
+
+#define MAT_VEC_FUSION_FLAGS_SIGMOID 0x20
+
+// GATED_DELTA_NET that also normalizes q and k: rms_norm(x, eps) * scale
+struct vk_gdn_fusion {
+    const ggml_tensor * q;
+    const ggml_tensor * k;
+    float eps;
+    float scale;
+};
+
+// mat-vec that also computes the elementwise ops after it and writes the last one's result
+struct vk_mmv_epilogue {
+    const ggml_tensor * dst;
+    const ggml_tensor * fuse0;
+    const ggml_tensor * fuse1;
+    uint32_t flags;
+};
 
 struct vk_staging_memcpy {
     vk_staging_memcpy(void * _dst, const void * _src, size_t _n) : dst(_dst), src(_src), n(_n) {}
@@ -1279,6 +1305,11 @@ struct ggml_backend_vk_context {
     // Track which nodes have been used since the last sync, and whether they were written to
     std::vector<const ggml_tensor *> unsynced_nodes_written;
     std::vector<const ggml_tensor *> unsynced_nodes_read;
+
+    // Nodes computed by a later node of the graph (non-adjacent fusion), by node index
+    std::vector<bool> fused_away;
+    std::unordered_map<const ggml_tensor *, vk_gdn_fusion> gdn_fusions;
+    std::unordered_map<const ggml_tensor *, vk_mmv_epilogue> mmv_epilogues;
     // Track which prealloc buffers have pending reads that need to be synchronized.
     // These are checked before writing to the buffer (and call ggml_vk_sync_buffers if set),
     // and set to true after the buffer contents are consumed.

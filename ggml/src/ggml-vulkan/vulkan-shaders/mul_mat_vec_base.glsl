@@ -93,6 +93,20 @@ layout (constant_id = 0) const uint BLOCK_SIZE = 32;
 layout (constant_id = 1) const uint NUM_ROWS = 1;
 layout (constant_id = 2) const uint NUM_COLS = 1;
 
+#ifndef MUL_MAT_ID
+// softplus(x) * fuse1 and sigmoid(x), the gate and beta inputs of gated delta net, as the unary shaders compute them
+FLOAT_TYPE mat_vec_activation(const FLOAT_TYPE v, const uint i) {
+    float x = float(v);
+    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SOFTPLUS_SCALE1) != 0) {
+        x = ((x > 20.0f) ? x : log(1.0f + exp(x))) * float(data_fuse1[i]);
+    }
+    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SIGMOID) != 0) {
+        x = 1.0f / (1.0f + exp(-x));
+    }
+    return FLOAT_TYPE(x);
+}
+#endif
+
 #ifdef USE_SUBGROUP_ADD_NO_SHMEM
 void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offset, const in uint32_t first_row, const in uint32_t num_rows, const in uint32_t tid) {
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
@@ -126,6 +140,7 @@ void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t 
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS1) != 0) {
                     temp[j][n] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
                 }
+                temp[j][n] = mat_vec_activation(temp[j][n], j*p.batch_stride_d + d_offset + first_row + n);
 #endif
                 data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(temp[j][n]);
             }
@@ -184,6 +199,7 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS1) != 0) {
                     temp[j][n] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
                 }
+                temp[j][n] = mat_vec_activation(temp[j][n], j*p.batch_stride_d + d_offset + first_row + n);
 #endif
                 data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(temp[j][n]);
             }
@@ -232,6 +248,7 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS1) != 0) {
                     tmpsh[j][n][0] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
                 }
+                tmpsh[j][n][0] = mat_vec_activation(tmpsh[j][n][0], j*p.batch_stride_d + d_offset + first_row + n);
 #endif
                 data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(tmpsh[j][n][0]);
             }

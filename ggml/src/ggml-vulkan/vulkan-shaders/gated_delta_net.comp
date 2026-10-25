@@ -32,6 +32,9 @@ layout(push_constant) uniform Parameters {
     uint neq1, rq3;
     float scale;
     uint K;
+    // QK_NORM: q and k are normalized as rms_norm(x, qk_eps) * qk_scale
+    float qk_eps;
+    float qk_scale;
 };
 
 layout(binding = 0) readonly  buffer QBuf     { FLOAT_TYPE data_q[];     };
@@ -92,6 +95,41 @@ FLOAT_TYPE reduce_partial(FLOAT_TYPE partial) {
     }
 }
 
+#if QK_NORM
+shared FLOAT_TYPE qk_tmp[SUBGROUP_SIZE];
+
+// rms_norm(v, qk_eps) * qk_scale of a column, summed in the order of the tree in rms_norm.comp
+void qk_norm(inout FLOAT_TYPE v[ROWS_PER_LANE]) {
+    // rows r and r + s hold elements that are s * LANES_PER_COLUMN apart
+    precise FLOAT_TYPE sq[ROWS_PER_LANE];
+    [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+        sq[r] = v[r] * v[r];
+    }
+    [[unroll]] for (uint s = ROWS_PER_LANE / 2u; s > 0; s >>= 1u) {
+        [[unroll]] for (uint r = 0; r < s; r++) {
+            sq[r] = sq[r] + sq[r + s];
+        }
+    }
+    const uint lane = gl_SubgroupInvocationID;
+    qk_tmp[lane] = sq[0];
+    barrier();
+    [[unroll]] for (uint s = LANES_PER_COLUMN / 2u; s > 0; s >>= 1u) {
+        precise const FLOAT_TYPE sum = qk_tmp[lane] + qk_tmp[lane ^ s];
+        barrier();
+        qk_tmp[lane] = sum;
+        barrier();
+    }
+    const FLOAT_TYPE sum = qk_tmp[lane];
+    barrier();
+
+    const FLOAT_TYPE mean = sum / FLOAT_TYPE(S_V);
+    const FLOAT_TYPE rscale = inversesqrt(mean + FLOAT_TYPE(qk_eps));
+    [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+        v[r] = FLOAT_TYPE(rscale * v[r]) * FLOAT_TYPE(qk_scale);
+    }
+}
+#endif
+
 void main() {
     const uint head_id = gl_WorkGroupID.x;
     const uint seq_id = gl_WorkGroupID.y;
@@ -132,6 +170,11 @@ void main() {
             k_reg[r] = FLOAT_TYPE(data_k[k_off + i]);
             q_reg[r] = FLOAT_TYPE(data_q[q_off + i]);
         }
+#if QK_NORM
+        // q and k are the inputs of the norms, normalized here
+        qk_norm(k_reg);
+        qk_norm(q_reg);
+#endif
 
         FLOAT_TYPE g_exp[ROWS_PER_LANE];
         if (KDA == 0) {

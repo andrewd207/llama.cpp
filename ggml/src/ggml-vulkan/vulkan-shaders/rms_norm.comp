@@ -36,6 +36,11 @@ layout (binding = 4) readonly buffer E {float data_e[];};
 
 layout (binding = 3) readonly buffer I {uvec2 data_i[];};
 
+#elif RMS_NORM_GATE_FUSION
+
+// the result is multiplied by silu(gate), gate has the contiguous layout of dst
+layout (binding = 3) readonly buffer G {float data_gate[];};
+
 #endif
 
 #extension GL_EXT_control_flow_attributes : enable
@@ -78,6 +83,9 @@ void rms_norm(uint num_iters) {
 #else
             uint32_t d_offset = ((samp*nchannels + channel)*nrows + row)*ncols + get_doffset();
 #endif
+#if RMS_NORM_GATE_FUSION
+            const uint32_t g_offset = ((samp*nchannels + channel)*nrows + row)*ncols;
+#endif
             FLOAT_TYPE sum = FLOAT_TYPE(0.0f); // partial sum for thread in warp
 
             [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
@@ -115,6 +123,10 @@ void rms_norm(uint num_iters) {
                         if (do_post_multiply) {
                             value *= FLOAT_TYPE(data_e[0]);
                         }
+#elif RMS_NORM_GATE_FUSION
+                        // as silu_mul computes it
+                        const float g = data_gate[g_offset + col];
+                        value = FLOAT_TYPE(g / (1.0f + exp(-g))) * value;
 #endif
                         data_d[d_offset + col] = D_TYPE(value);
                     }
@@ -129,6 +141,10 @@ void rms_norm(uint num_iters) {
                         if (do_post_multiply) {
                             value *= FLOAT_TYPE(data_e[0]);
                         }
+#elif RMS_NORM_GATE_FUSION
+                        // as silu_mul computes it
+                        const float g = data_gate[g_offset + col];
+                        value = FLOAT_TYPE(g / (1.0f + exp(-g))) * value;
 #endif
                         data_d[d_offset + col] = D_TYPE(value);
                     }

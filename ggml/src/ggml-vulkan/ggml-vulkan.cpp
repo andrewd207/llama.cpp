@@ -3312,6 +3312,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_f32, "rms_norm_f32", rms_norm_f32_len, rms_norm_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_f32, "rms_norm_mul_f32", rms_norm_f32_len, rms_norm_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1}, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_gate_f32, "rms_norm_mul_gate_f32", rms_norm_mul_gate_f32_len, rms_norm_mul_gate_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_add_f32, "rms_norm_mul_add_f32", rms_norm_mul_add_f32_len, rms_norm_mul_add_f32_data, "main", 5, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 0}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_add_mul_f32, "rms_norm_mul_add_mul_f32", rms_norm_mul_add_f32_len, rms_norm_mul_add_f32_data, "main", 5, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 1}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_add_partials_f32, "rms_norm_mul_add_partials_f32", rms_norm_mul_add_partials_f32_len, rms_norm_mul_add_partials_f32_data, "main", 6, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 0}, 1, true);
@@ -3765,17 +3766,23 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             const bool use_clustered_reduce = device->subgroup_arithmetic && device->subgroup_clustered && need_partial_subgroup_reduce;
             const bool use_subgroup_reduce = device->subgroup_arithmetic && !need_partial_subgroup_reduce;
             const bool use_subgroup_ops = use_clustered_reduce || use_subgroup_reduce;
-            size_t gdn_len;
-            const void * gdn_data;
+            size_t gdn_len, gdn_qkn_len;
+            const void * gdn_data, * gdn_qkn_data;
             if (use_clustered_reduce) {
                 gdn_len = gated_delta_net_f32_len;
                 gdn_data = (const void *)gated_delta_net_f32_data;
+                gdn_qkn_len = gated_delta_net_f32_qkn_len;
+                gdn_qkn_data = (const void *)gated_delta_net_f32_qkn_data;
             } else if (use_subgroup_reduce) {
                 gdn_len = gated_delta_net_f32_nocluster_len;
                 gdn_data = (const void *)gated_delta_net_f32_nocluster_data;
+                gdn_qkn_len = gated_delta_net_f32_nocluster_qkn_len;
+                gdn_qkn_data = (const void *)gated_delta_net_f32_nocluster_qkn_data;
             } else {
                 gdn_len = gated_delta_net_f32_shmem_len;
                 gdn_data = (const void *)gated_delta_net_f32_shmem_data;
+                gdn_qkn_len = gated_delta_net_f32_shmem_qkn_len;
+                gdn_qkn_data = (const void *)gated_delta_net_f32_shmem_qkn_data;
             }
 
             const uint32_t cols_per_wg = gdn_subgroup_size / lanes_per_column;
@@ -3786,6 +3793,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     gdn_names[si][kda], gdn_len, gdn_data, "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
                     wg_denoms, {S_V, kda, gdn_subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, gdn_subgroup_size);
             }
+            ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_qkn[si],
+                (std::string(gdn_names[si][0]) + "_qkn").c_str(), gdn_qkn_len, gdn_qkn_data, "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
+                wg_denoms, {S_V, 0, gdn_subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, gdn_subgroup_size);
         }
     }
 
@@ -6901,7 +6911,10 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
         }
     }
 
-    vk_subbuffer d_D = ggml_vk_tensor_subbuffer(ctx, cgraph->nodes[node_idx + ctx->num_additional_fused_ops]);
+    const auto epilogue = swap_inputs ? ctx->mmv_epilogues.end() : ctx->mmv_epilogues.find(dst);
+    const vk_mmv_epilogue * epi = epilogue != ctx->mmv_epilogues.end() ? &epilogue->second : nullptr;
+
+    vk_subbuffer d_D = ggml_vk_tensor_subbuffer(ctx, epi ? epi->dst : cgraph->nodes[node_idx + ctx->num_additional_fused_ops]);
     vk_subbuffer d_Qx = ggml_vk_tensor_subbuffer(ctx, src0);
     vk_subbuffer d_Qy = ggml_vk_tensor_subbuffer(ctx, src1);
     vk_subbuffer d_X, d_Y;
@@ -6995,6 +7008,16 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
 
         d_F1 = ggml_vk_tensor_subbuffer(ctx, bias);
         fusion_flags |= MAT_VEC_FUSION_FLAGS_BIAS1;
+    }
+
+    if (epi) {
+        if (epi->fuse0) {
+            d_F0 = ggml_vk_tensor_subbuffer(ctx, epi->fuse0);
+        }
+        if (epi->fuse1) {
+            d_F1 = ggml_vk_tensor_subbuffer(ctx, epi->fuse1);
+        }
+        fusion_flags = epi->flags;
     }
 
     ggml_pipeline_request_descriptor_sets(ctx, dmmv, CEIL_DIV(ne12 * ne13, ctx->device->properties.limits.maxComputeWorkGroupCount[1]));
@@ -7390,7 +7413,10 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
     // This only supports batchsize == 1.
     const size_t nbytes = ggml_nbytes(src0);
     const bool needs_split = dst->ne[2] == 1 && dst->ne[3] == 1 && nbytes > ctx->device->properties.limits.maxStorageBufferRange;
+    // only ggml_vk_mul_mat_vec_q_f16 runs an epilogue (the nodes it replaces are skipped)
+    const bool epilogue = ctx->mmv_epilogues.count(dst) != 0;
     if (needs_split) {
+        GGML_ASSERT(!epilogue);
         // Choose the number of rows that can fit (and divide by two, to allow for any additional offsets)
         const uint32_t M_split = ctx->device->properties.limits.maxStorageBufferRange / (2 * src0->nb[1]);
         uint32_t m_offset = 0;
@@ -7412,6 +7438,7 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
             m_offset += cur_M_size;
         }
     } else if (ggml_vk_can_use_fwht(ctx, src1, dst)) {
+        GGML_ASSERT(!epilogue);
         ggml_vk_fwht(ctx, subctx, src1, dst);
     } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F32 && ggml_is_permuted(src0) && ggml_is_permuted(src1) && dst->ne[1] == 1 &&
         // detect 0213 permutation, and batch size of 1
@@ -7425,12 +7452,14 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
         src1->ne[3] == 1 &&
         src0->ne[1] <= ctx->device->properties.limits.maxComputeWorkGroupCount[1] &&
         src1->ne[2] <= ctx->device->properties.limits.maxComputeWorkGroupCount[2]) {
+        GGML_ASSERT(!epilogue);
         ggml_vk_mul_mat_vec_p021_f16_f32(ctx, subctx, cgraph, node_idx);
     } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F32 && !ggml_is_contiguous(src0) && !ggml_is_transposed(src1) && dst->ne[1] == 1 &&
                !ggml_is_permuted(src0) && !ggml_is_permuted(src1) &&
                src0->ne[3] <= ctx->device->properties.limits.maxComputeWorkGroupCount[0] &&
                src0->ne[1] <= ctx->device->properties.limits.maxComputeWorkGroupCount[1] &&
                src1->ne[2] <= ctx->device->properties.limits.maxComputeWorkGroupCount[2]) {
+        GGML_ASSERT(!epilogue);
         ggml_vk_mul_mat_vec_nc_f16_f32(ctx, subctx, cgraph, node_idx);
     // With one output row, B^T*A has the same flat output as A^T*B.
     } else if (ctx->num_additional_fused_ops == 0 &&
@@ -7441,6 +7470,7 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
                src1->ne[2] == 1 && src1->ne[3] == 1 &&
                ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
                get_misalign_bytes(ctx, src0) == 0 && get_misalign_bytes(ctx, src1) == 0 && get_misalign_bytes(ctx, dst) == 0) {
+        GGML_ASSERT(!epilogue);
         ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx, true);
     // mul_mat_vec supports batching ne12*ne13 when ne11==1, or treating ne11 as the batch size (up to four)
     // when ne12 and ne13 are one.
@@ -7448,6 +7478,7 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
                (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type))) {
         ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx);
     } else {
+        GGML_ASSERT(!epilogue);
         ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, false);
     }
 }
@@ -10409,7 +10440,10 @@ void ggml_vk_lightning_indexer(ggml_backend_vk_context * ctx, vk_context& subctx
 }
 
 void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
-    const ggml_tensor * src_q     = dst->src[0];
+    const auto fusion = ctx->gdn_fusions.find(dst);
+    const vk_gdn_fusion * fused = fusion != ctx->gdn_fusions.end() ? &fusion->second : nullptr;
+
+    const ggml_tensor * src_q     = fused ? fused->q : dst->src[0];
     const ggml_tensor * src_v     = dst->src[2];
     const ggml_tensor * src_beta  = dst->src[4];
 
@@ -10428,13 +10462,19 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
     vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, dst->src[0], dst->src[1], dst->src[2], dst, dst->op);
     GGML_ASSERT(pipeline != nullptr);
 
-    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
-
     vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
     vk_subbuffer src_buf[6] = {};
     for (int i = 0; i < 6; i++) {
         src_buf[i] = ggml_vk_tensor_subbuffer(ctx, dst->src[i]);
     }
+    if (fused) {
+        // S_v is 16, 32, 64 or 128, checked by ggml_vk_op_get_pipeline
+        pipeline = ctx->device->pipeline_gated_delta_net_qkn[S_v == 16 ? 0 : S_v == 32 ? 1 : S_v == 64 ? 2 : 3];
+        src_buf[0] = ggml_vk_tensor_subbuffer(ctx, fused->q);
+        src_buf[1] = ggml_vk_tensor_subbuffer(ctx, fused->k);
+    }
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
     const uint32_t sq1 = (uint32_t)(src_q->nb[1] / sizeof(float));
     const uint32_t sq2 = (uint32_t)(src_q->nb[2] / sizeof(float));
@@ -10457,7 +10497,9 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
         sb1, sb2, sb3,
         neq1, rq3,
         scale,
-        K
+        K,
+        fused ? fused->eps : 0.0f,
+        fused ? fused->scale : 0.0f,
     };
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
@@ -11127,6 +11169,23 @@ void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const s
                 ggml_vk_subbuffer(ctx, buf[5], offset[5]),
                 ggml_vk_subbuffer(ctx, buf[6], offset[6]),
             }, pc, elements);
+    } else if (ctx->fused_rms_norm_mode == RMS_NORM_MUL_SILU_MUL) {
+        // rms_norm + mul, times silu(gate)
+        GGML_ASSERT(ctx->num_additional_fused_ops == 3);
+        ggml_tensor * out = cgraph->nodes[node_idx + 3];
+        const ggml_tensor * gate = cgraph->nodes[node_idx + 2]->src[0];
+        bin = ggml_vk_rms_norm_push_constants(src0, src1, out, op_params[0], 0);
+        init_pushconst_tensor_offsets(ctx, bin, src0, src1, nullptr, nullptr, out);
+        vk_pipeline pipeline = ctx->device->pipeline_rms_norm_mul_gate_f32;
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+            { ggml_vk_tensor_subbuffer(ctx, src0, true), ggml_vk_tensor_subbuffer(ctx, src1, true),
+              ggml_vk_tensor_subbuffer(ctx, out, true), ggml_vk_tensor_subbuffer(ctx, gate) },
+            bin, {
+                (uint32_t)src0->ne[1],
+                std::min((uint32_t)src0->ne[2], ctx->device->properties.limits.maxComputeWorkGroupCount[1]),
+                std::min((uint32_t)src0->ne[3], ctx->device->properties.limits.maxComputeWorkGroupCount[2]),
+            });
     } else {
         GGML_ASSERT(ctx->fused_rms_norm_mode == RMS_NORM_MUL || ctx->fused_rms_norm_mode == RMS_NORM_COUNT);
         ggml_vk_op_f32<vk_op_binary_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_RMS_NORM, std::move(bin));
@@ -12402,6 +12461,9 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
     if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
         return false;
     }
+    if (!ctx->fused_away.empty() && ctx->fused_away[node_idx]) {
+        return false;
+    }
 
     VK_LOG_DEBUG("ggml_vk_build_graph(" << node << ", " << ggml_op_name(node->op) << ")");
     ctx->semaphore_idx = 0;
@@ -12465,13 +12527,33 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
             return false;
         };
 
+        // A non-adjacent fusion reads the inputs of the nodes it computes, and writes the last one's output
+        std::vector<const ggml_tensor *> fused_srcs;
+        const ggml_tensor * fused_dst = nullptr;
+        if (node->op == GGML_OP_GATED_DELTA_NET) {
+            auto it = ctx->gdn_fusions.find(node);
+            if (it != ctx->gdn_fusions.end()) {
+                fused_srcs = { it->second.q, it->second.k };
+            }
+        } else if (node->op == GGML_OP_MUL_MAT) {
+            auto it = ctx->mmv_epilogues.find(node);
+            if (it != ctx->mmv_epilogues.end()) {
+                fused_dst = it->second.dst;
+                fused_srcs = { it->second.fuse0, it->second.fuse1 };
+            }
+        }
+        for (const ggml_tensor * t : fused_srcs) {
+            need_sync = need_sync || (t && overlaps_unsynced(t, ctx->unsynced_nodes_written));
+        }
+
         // For all fused ops, check if the destination node or any of the source
         // nodes require synchronization.
         for (int32_t i = 0; i < ctx->num_additional_fused_ops + 1 && !need_sync; ++i) {
             const ggml_tensor *cur_node = cgraph->nodes[node_idx + i];
             // If the node actually writes to memory, then check if it needs to sync
             if (ctx->fused_ops_write_mask & (1 << i)) {
-                if (overlaps_unsynced(cur_node, ctx->unsynced_nodes_read) || overlaps_unsynced(cur_node, ctx->unsynced_nodes_written)) {
+                const ggml_tensor * written = i == 0 && fused_dst ? fused_dst : cur_node;
+                if (overlaps_unsynced(written, ctx->unsynced_nodes_read) || overlaps_unsynced(written, ctx->unsynced_nodes_written)) {
                     need_sync = true;
                     break;
                 }
@@ -12502,11 +12584,16 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
             }
         }
         // Add all fused nodes to the unsynchronized lists.
+        for (const ggml_tensor * t : fused_srcs) {
+            if (t) {
+                ctx->unsynced_nodes_read.push_back(t);
+            }
+        }
         for (int32_t i = 0; i < ctx->num_additional_fused_ops + 1; ++i) {
             const ggml_tensor *cur_node = cgraph->nodes[node_idx + i];
             // Multiple outputs could be written, e.g. in topk_moe. Add them all to the list.
             if (ctx->fused_ops_write_mask & (1 << i)) {
-                ctx->unsynced_nodes_written.push_back(cur_node);
+                ctx->unsynced_nodes_written.push_back(i == 0 && fused_dst ? fused_dst : cur_node);
             }
             for (uint32_t j = 0; j < GGML_MAX_SRC; ++j) {
                 if (!cur_node->src[j]) {
@@ -13914,6 +14001,30 @@ bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgr
     return true;
 }
 
+// rms_norm(x) * w * silu(gate), the gated norm of linear attention layers
+static bool ggml_vk_can_fuse_rms_norm_mul_gate(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, rms_norm_mul_silu_mul_pattern, { node_idx + 3 }) ||
+        !ggml_vk_can_fuse(ctx, cgraph, node_idx, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
+        return false;
+    }
+    const ggml_tensor * mul  = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * silu = cgraph->nodes[node_idx + 2];
+    const ggml_tensor * out  = cgraph->nodes[node_idx + 3];
+    const ggml_tensor * gate = silu->src[0];
+    if (ggml_get_unary_op(silu) != GGML_UNARY_OP_SILU ||
+        !((out->src[0] == mul && out->src[1] == silu) || (out->src[0] == silu && out->src[1] == mul))) {
+        return false;
+    }
+    // the shader indexes dst and gate as contiguous tensors of the rms_norm shape
+    if (gate->type != GGML_TYPE_F32 || out->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(mul, out) || !ggml_are_same_shape(gate, out) ||
+        !ggml_is_contiguous(gate) || !ggml_is_contiguous(out) ||
+        get_misalign_bytes(ctx, gate) != 0) {
+        return false;
+    }
+    return true;
+}
+
 bool ggml_vk_can_fuse_ssm_conv(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
                                       int node_idx, int num_extra) {
     const ggml_tensor * conv = cgraph->nodes[node_idx];
@@ -14503,6 +14614,213 @@ static void ggml_vk_graph_cache_retire(ggml_backend_vk_context * ctx, size_t idx
     ctx->graph_cache.erase(ctx->graph_cache.begin() + idx);
 }
 
+// Fusions of nodes that are not adjacent in the graph. The fused nodes are skipped and their work
+// moves into another node, so the tensors that work reads or writes must not be used in between.
+
+// true if a node in (first, last] that is not in skip writes t, or reads t when reads is set
+static bool ggml_vk_nodes_use(ggml_cgraph * cgraph, int first, int last, const std::vector<int> & skip, const ggml_tensor * t, bool reads) {
+    for (int j = first + 1; j <= last; j++) {
+        ggml_tensor * node = cgraph->nodes[j];
+        if (ggml_vk_is_empty(node) || !(node->flags & GGML_TENSOR_FLAG_COMPUTE) || !node->buffer ||
+            std::find(skip.begin(), skip.end(), j) != skip.end()) {
+            continue;
+        }
+        if (ggml_vk_tensors_overlap(node, t, false)) {
+            return true;
+        }
+        for (int s = 0; s < GGML_MAX_SRC && reads; s++) {
+            if (node->src[s] && node->src[s]->buffer && ggml_vk_tensors_overlap(node->src[s], t, false)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// fused nodes are searched for this far from each other
+static constexpr int vk_deferred_fusion_window = 32;
+
+// the only node after idx that uses nodes[idx], or -1
+static int ggml_vk_single_user(const ggml_cgraph * cgraph, int idx) {
+    if (ggml_node_get_use_count(cgraph, idx) != 1) {
+        return -1;
+    }
+    for (int j = idx + 1; j < std::min(cgraph->n_nodes, idx + vk_deferred_fusion_window); j++) {
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            if (cgraph->nodes[j]->src[s] == cgraph->nodes[idx]) {
+                return j;
+            }
+        }
+    }
+    return -1;
+}
+
+static bool ggml_vk_fuse_subgraph(const ggml_cgraph * cgraph, const std::vector<int> & idxs) {
+    int idx[16];
+    ggml_op ops[16];
+    GGML_ASSERT(idxs.size() <= 16);
+    for (size_t i = 0; i < idxs.size(); i++) {
+        idx[i] = idxs[i];
+        ops[i] = cgraph->nodes[idxs[i]]->op;
+    }
+    return ggml_can_fuse_subgraph_ext(cgraph, idx, (int)idxs.size(), ops, &idx[idxs.size() - 1], 1);
+}
+
+// index of t among the nodes before g, or -1
+static int ggml_vk_find_node_before(const ggml_cgraph * cgraph, int g, const ggml_tensor * t) {
+    for (int j = g - 1; j >= std::max(0, g - vk_deferred_fusion_window); j--) {
+        if (cgraph->nodes[j] == t) {
+            return j;
+        }
+    }
+    return -1;
+}
+
+// GATED_DELTA_NET normalizes its q and k inputs instead of the rms_norm and scale nodes of build_gdn_l2_norm
+static void ggml_vk_find_gdn_qk_norm(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, int g) {
+    const ggml_tensor * gdn = cgraph->nodes[g];
+    const ggml_tensor * sq = gdn->src[0];
+    const ggml_tensor * sk = gdn->src[1];
+    // only the pipelines with one gate value per head have this variant
+    if (sq->op != GGML_OP_SCALE || sk->op != GGML_OP_SCALE || !gdn->buffer || gdn->src[3]->ne[0] == gdn->src[2]->ne[0]) {
+        return;
+    }
+    const ggml_tensor * rq = sq->src[0];
+    const ggml_tensor * rk = sk->src[0];
+    if (rq->op != GGML_OP_RMS_NORM || rk->op != GGML_OP_RMS_NORM) {
+        return;
+    }
+    const vk_gdn_fusion f = { rq->src[0], rk->src[0], ggml_get_op_params_f32(rq, 0), ggml_get_op_params_f32(sq, 0) };
+    // the shader reads q and k with the same strides and has no scale bias
+    if (ggml_get_op_params_f32(rk, 0) != f.eps || ggml_get_op_params_f32(sk, 0) != f.scale ||
+        ggml_get_op_params_f32(sq, 1) != 0.0f || ggml_get_op_params_f32(sk, 1) != 0.0f ||
+        !ggml_are_same_shape(f.q, f.k) || !ggml_are_same_stride(f.q, f.k) || f.q->nb[0] != sizeof(float)) {
+        return;
+    }
+    for (const ggml_tensor * t : { f.q, f.k }) {
+        if (t->type != GGML_TYPE_F32 || !t->buffer || get_misalign_bytes(ctx, t) != 0) {
+            return;
+        }
+    }
+    std::vector<int> idxs;
+    for (const ggml_tensor * t : { rq, sq, rk, sk }) {
+        const int j = ggml_vk_find_node_before(cgraph, g, t);
+        if (j < 0) {
+            return;
+        }
+        idxs.push_back(j);
+    }
+    std::sort(idxs.begin(), idxs.end());
+    idxs.push_back(g);
+    if (!ggml_vk_fuse_subgraph(cgraph, idxs) ||
+        ggml_vk_nodes_use(cgraph, idxs[0], g, idxs, f.q, false) ||
+        ggml_vk_nodes_use(cgraph, idxs[0], g, idxs, f.k, false) ||
+        ggml_vk_tensors_overlap(gdn, f.q, false) || ggml_vk_tensors_overlap(gdn, f.k, false)) {
+        return;
+    }
+    for (size_t i = 0; i + 1 < idxs.size(); i++) {
+        ctx->fused_away[idxs[i]] = true;
+    }
+    ctx->gdn_fusions[gdn] = f;
+}
+
+// A mat-vec computes the ops after it and writes the result of the last one:
+// softplus(x + fuse0) * fuse1 (the gated delta net gate) or sigmoid(x) (its beta)
+static void ggml_vk_find_mmv_epilogue(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, int m) {
+    ggml_tensor * mm = cgraph->nodes[m];
+    const ggml_tensor * src0 = mm->src[0];
+    const int64_t n = mm->ne[0];
+    // the shapes that ggml_vk_mul_mat sends to ggml_vk_mul_mat_vec_q_f16
+    if (ggml_nrows(mm) != 1 || mm->type != GGML_TYPE_F32 || !mm->buffer || !ggml_is_contiguous(src0) ||
+        !(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type)) ||
+        ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange || ggml_vk_can_use_fwht(ctx, mm->src[1], mm)) {
+        return;
+    }
+
+    std::vector<int> idxs = { m };
+    auto next = [&](ggml_op op) -> const ggml_tensor * {
+        int j = ggml_vk_single_user(cgraph, idxs.back());
+        while (j >= 0 && cgraph->nodes[j]->op == GGML_OP_RESHAPE) {
+            idxs.push_back(j);
+            j = ggml_vk_single_user(cgraph, j);
+        }
+        if (j < 0 || cgraph->nodes[j]->op != op || cgraph->nodes[j]->type != GGML_TYPE_F32 ||
+            ggml_nelements(cgraph->nodes[j]) != n || !ggml_is_contiguous(cgraph->nodes[j])) {
+            return nullptr;
+        }
+        idxs.push_back(j);
+        return cgraph->nodes[j];
+    };
+    // the other src of a binary op, a weight with one value per row
+    auto weight = [&](const ggml_tensor * op) -> const ggml_tensor * {
+        const ggml_tensor * w = op->src[0] == cgraph->nodes[idxs[idxs.size() - 2]] ? op->src[1] : op->src[0];
+        return w->op == GGML_OP_NONE && w->type == GGML_TYPE_F32 && ggml_nelements(w) == n && ggml_is_contiguous(w) &&
+               w->buffer && get_misalign_bytes(ctx, w) == 0 ? w : nullptr;
+    };
+
+    vk_mmv_epilogue e {};
+    const ggml_tensor * t = next(GGML_OP_ADD);
+    if (t) {
+        e.fuse0 = weight(t);
+        const ggml_tensor * sp = e.fuse0 ? next(GGML_OP_UNARY) : nullptr;
+        const ggml_tensor * mul = sp && ggml_get_unary_op(sp) == GGML_UNARY_OP_SOFTPLUS ? next(GGML_OP_MUL) : nullptr;
+        e.fuse1 = mul ? weight(mul) : nullptr;
+        if (!e.fuse1) {
+            return;
+        }
+        e.dst = mul;
+        e.flags = MAT_VEC_FUSION_FLAGS_BIAS0 | MAT_VEC_FUSION_FLAGS_SOFTPLUS_SCALE1;
+    } else {
+        idxs.resize(1);
+        t = next(GGML_OP_UNARY);
+        if (!t || ggml_get_unary_op(t) != GGML_UNARY_OP_SIGMOID) {
+            return;
+        }
+        e.dst = t;
+        e.flags = MAT_VEC_FUSION_FLAGS_SIGMOID;
+    }
+
+    // e.dst is written at m instead of at its own node, so nothing in between may use its memory
+    const int last = idxs.back();
+    if (get_misalign_bytes(ctx, e.dst) != 0 || !ggml_vk_fuse_subgraph(cgraph, idxs) ||
+        ggml_vk_nodes_use(cgraph, m, last, idxs, e.dst, true) ||
+        ggml_vk_tensors_overlap(mm->src[0], e.dst, false) || ggml_vk_tensors_overlap(mm->src[1], e.dst, false)) {
+        return;
+    }
+    for (size_t i = 1; i < idxs.size(); i++) {
+        ctx->fused_away[idxs[i]] = true;
+    }
+    ctx->mmv_epilogues[mm] = e;
+}
+
+static void ggml_vk_find_deferred_fusions(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph) {
+    ctx->gdn_fusions.clear();
+    ctx->mmv_epilogues.clear();
+    ctx->fused_away.clear();
+#ifdef GGML_VULKAN_CHECK_RESULTS
+    return;
+#endif
+    if (ctx->device->disable_fusion) {
+        return;
+    }
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        ggml_tensor * node = cgraph->nodes[i];
+        if (!(node->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+            (node->op != GGML_OP_GATED_DELTA_NET && node->op != GGML_OP_MUL_MAT) ||
+            (!ctx->fused_away.empty() && ctx->fused_away[i])) {
+            continue;
+        }
+        if (ctx->fused_away.empty()) {
+            ctx->fused_away.resize(cgraph->n_nodes);
+        }
+        if (node->op == GGML_OP_MUL_MAT) {
+            ggml_vk_find_mmv_epilogue(ctx, cgraph, i);
+        } else {
+            ggml_vk_find_gdn_qk_norm(ctx, cgraph, i);
+        }
+    }
+}
+
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
@@ -14610,10 +14928,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     ctx->do_add_rms_partials = false;
     ctx->do_add_rms_partials_offset_calculation = false;
 
+    ggml_vk_find_deferred_fusions(ctx, cgraph);
+
     int last_node = cgraph->n_nodes - 1;
 
     // If the last op in the cgraph isn't backend GPU, the command buffer doesn't get closed properly
-    while (last_node > 0 && (ggml_vk_is_empty(cgraph->nodes[last_node]) || ((cgraph->nodes[last_node]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0))) {
+    while (last_node > 0 && (ggml_vk_is_empty(cgraph->nodes[last_node]) || ((cgraph->nodes[last_node]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) ||
+                             (!ctx->fused_away.empty() && ctx->fused_away[last_node]))) {
         last_node -= 1;
     }
 
@@ -14756,7 +15077,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_hc_post_gate = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         const char *fusion_string {};
-        if (!ctx->device->disable_fusion) {
+        // nodes in a non-adjacent fusion don't start an adjacent one
+        auto const &deferred = [&](int idx) {
+            return !ctx->fused_away.empty() && (ctx->fused_away[idx] || ctx->mmv_epilogues.count(cgraph->nodes[idx]));
+        };
+        if (!ctx->device->disable_fusion && !deferred(i)) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
             if (num_adds) {
                 ctx->num_additional_fused_ops = num_adds - 1;
@@ -14817,6 +15142,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_hc_post_gate = true;
                 fusion_string = "HC_POST_GATE";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
+            } else if (ggml_vk_can_fuse_rms_norm_mul_gate(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 3;
+                ctx->fused_rms_norm_mode = RMS_NORM_MUL_SILU_MUL;
+                fusion_string = "RMS_NORM_MUL_SILU_MUL";
+                // row-wise like RMS_NORM_MUL, the gate is read at the dst index
+                std::fill_n(op_srcs_fused_elementwise, 4, true);
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, rms_norm_mul_add_mul_pattern)) {
                 ctx->num_additional_fused_ops = 3;
                 ctx->fused_rms_norm_mode = RMS_NORM_MUL_ADD_MUL;
@@ -14940,6 +15271,19 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                     ctx->num_additional_fused_ops++;
                     op_srcs_fused_elementwise[ctx->num_additional_fused_ops] = false;
                 }
+            }
+        }
+        // don't let an adjacent fusion take nodes that a later node computes
+        for (int k = 1; k <= ctx->num_additional_fused_ops; ++k) {
+            if (deferred(i + k)) {
+                ctx->num_additional_fused_ops = 0;
+                ctx->fused_ops_write_mask = 0;
+                ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
+                ctx->fused_topk_moe_scale = false;
+                ctx->fused_topk_qsa = false;
+                ctx->fused_hc_post_gate = false;
+                ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
+                fusion_string = nullptr;
             }
         }
         GGML_ASSERT(ctx->num_additional_fused_ops < (int)(sizeof(op_srcs_fused_elementwise) / sizeof(op_srcs_fused_elementwise[0])));
@@ -15255,6 +15599,9 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         if (keep_pattern(rms_norm_mul_add_mul_pattern)) {
             continue;
         }
+        if (keep_pattern(rms_norm_mul_silu_mul_pattern)) {
+            continue;
+        }
         if (keep_pattern(rms_norm_mul_add_pattern)) {
             continue;
         }
@@ -15308,6 +15655,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 match_pattern(snake_pattern, j) ||
                 in_qsa_pattern(j) ||
                 match_pattern(rms_norm_mul_add_mul_pattern, j) ||
+                match_pattern(rms_norm_mul_silu_mul_pattern, j) ||
                 match_pattern(rms_norm_mul_add_pattern, j) ||
                 match_pattern(rms_norm_mul_rope_view_set_rows_pattern, j) ||
                 match_pattern(rms_norm_view_set_rows_pattern, j) ||
