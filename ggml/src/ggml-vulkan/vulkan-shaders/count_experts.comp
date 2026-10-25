@@ -21,31 +21,68 @@ layout (binding = 0) readonly buffer A {uint data_a[];};
 layout (binding = 1) writeonly buffer D {uint data_d[];};
 
 shared uint vals[BLOCK_SIZE];
+shared uint below_sh[BLOCK_SIZE];
 
+// Output layout, n_as = number of workgroups:
+//   [0, n_as)        uses of each expert
+//   [n_as, 2*n_as)   offset of each expert's list (uses of lower experts)
+//   [2*n_as, ...)    per-expert lists of (ii0 | ii1 << 16), in id order
 void main() {
     const uint expert_id = gl_WorkGroupID.x;
+    const uint n_as = gl_NumWorkGroups.x;
     const uint num_elements = p.ne00 * p.ne01;
     const uint tid = gl_LocalInvocationID.x;
 
     uint count = 0;
+    uint below = 0;
     for (uint idx = tid; idx < num_elements; idx += BLOCK_SIZE) {
         const uint i01 = idx / p.ne00;
         const uint i00 = idx % p.ne00;
         const uint a = data_a[p.a_offset + i01 * p.nb01 + i00 * p.nb00];
 
         count += uint(a == expert_id);
+        below += uint(a < expert_id);
     }
 
     vals[tid] = count;
+    below_sh[tid] = below;
     barrier();
     [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
         if (tid < s) {
             vals[tid] += vals[tid + s];
+            below_sh[tid] += below_sh[tid + s];
         }
         barrier();
     }
 
+    count = vals[0];
+    const uint base = 2 * n_as + below_sh[0];
     if (tid == 0) {
-        data_d[expert_id] = vals[0];
+        data_d[expert_id] = count;
+        data_d[n_as + expert_id] = below_sh[0];
+    }
+    barrier();
+
+    // ordered compaction, one inclusive scan per chunk
+    uint written = 0;
+    for (uint j = 0; j < num_elements && written < count; j += BLOCK_SIZE) {
+        const uint idx = j + tid;
+        const uint i01 = idx / p.ne00;
+        const uint i00 = idx % p.ne00;
+        const bool hit = idx < num_elements && data_a[p.a_offset + i01 * p.nb01 + i00 * p.nb00] == expert_id;
+
+        vals[tid] = uint(hit);
+        barrier();
+        [[unroll]] for (uint s = 1; s < BLOCK_SIZE; s <<= 1) {
+            const uint t = tid >= s ? vals[tid - s] : 0;
+            barrier();
+            vals[tid] += t;
+            barrier();
+        }
+        if (hit) {
+            data_d[base + written + vals[tid] - 1] = i00 | (i01 << 16);
+        }
+        written += vals[BLOCK_SIZE - 1];
+        barrier();
     }
 }

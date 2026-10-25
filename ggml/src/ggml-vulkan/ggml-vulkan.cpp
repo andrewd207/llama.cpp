@@ -10682,7 +10682,8 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     }
     vk_pipeline count_experts = ctx->device->pipeline_count_experts;
 
-    uint32_t expert_count_size = sizeof(uint32_t) * n_as;
+    // counts, offsets and compacted row lists, see count_experts.comp
+    uint32_t expert_count_size = sizeof(uint32_t) * (2 * n_as + nei0 * nei1);
 
     {
         if (
