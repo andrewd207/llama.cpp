@@ -68,6 +68,16 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #include <condition_variable>
 #include <thread>
 
+#if defined(__linux__) && __has_include(<linux/kfd_ioctl.h>)
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <fstream>
+#include <linux/kfd_ioctl.h>
+#define GGML_VK_AMD_KFD_PROFILE
+#endif
+
 #if defined(_MSC_VER)
 # define NOMINMAX 1
 # include <windows.h>
@@ -274,6 +284,7 @@ struct vk_matmul_pipeline2 {
 };
 
 struct vk_device_struct;
+struct vk_amd_compute_profile;
 typedef std::shared_ptr<vk_device_struct> vk_device;
 typedef std::weak_ptr<vk_device_struct> vk_device_ref;
 
@@ -796,6 +807,7 @@ struct vk_device_struct {
     vk::Device device;
     uint32_t vendor_id;
     vk::DriverId driver_id;
+    vk_amd_compute_profile * amd_compute_profile = nullptr;
     vk_device_architecture architecture;
     std::unique_ptr<vk_queue> compute_queue;
     std::unique_ptr<vk_queue> transfer_queue;
@@ -2125,6 +2137,213 @@ static bool vk_enable_sync_logger = false;
 // number of calls between perf logger prints
 static uint32_t vk_perf_logger_frequency = 1;
 static std::string vk_pipeline_stats_filter;
+static bool vk_amd_compute_profile_enabled = false;
+
+#ifdef GGML_VK_AMD_KFD_PROFILE
+// GGML_VK_AMD_COMPUTE_PROFILE: amdgpu selects the COMPUTE power profile (and on RDNA3 disables GFXOFF)
+// while a process has a KFD queue, as it does for ROCm. Vulkan work otherwise runs under 3D_FULL_SCREEN,
+// which keeps clocks low for bursty work such as models with experts on the CPU. While the device is
+// busy, hold an empty SDMA queue; nothing is ever submitted to it. Drop it after a second idle.
+struct vk_amd_compute_profile {
+    static constexpr int64_t idle_timeout_ms = 1000;
+
+    int kfd = -1;
+    int drm = -1;
+    std::string sysfs_profile;
+    kfd_ioctl_create_queue_args queue_args {};
+    uint32_t queue_id = 0;
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool active = false;
+    int busy = 0;
+    int64_t last_use = 0;
+    int64_t last_try = INT64_MIN / 2;
+    bool logged = false;
+
+    static int64_t now_ms() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    // the starred line of pp_power_profile_mode is the active profile
+    std::string current_profile() const {
+        std::ifstream f(sysfs_profile);
+        std::string line;
+        while (std::getline(f, line)) {
+            const size_t star = line.find('*');
+            if (star != std::string::npos) {
+                const size_t b = line.find_first_not_of(" 0123456789");
+                return b < star ? line.substr(b, star - b) : "";
+            }
+        }
+        return "";
+    }
+
+    bool init(const std::string & pci_id) {
+        unsigned domain, bus, dev, fn;
+        if (sscanf(pci_id.c_str(), "%x:%x:%x.%x", &domain, &bus, &dev, &fn) != 4) {
+            return false;
+        }
+        const uint64_t location = (bus << 8) | (dev << 3) | fn;
+        sysfs_profile = "/sys/bus/pci/devices/" + pci_id + "/pp_power_profile_mode";
+
+        // find the KFD topology node of this device
+        uint32_t gpu_id = 0;
+        uint32_t render_minor = 0;
+        for (int n = 0; gpu_id == 0; n++) {
+            const std::string node = "/sys/class/kfd/kfd/topology/nodes/" + std::to_string(n);
+            std::ifstream props(node + "/properties");
+            if (!props) {
+                return false;
+            }
+            std::string key;
+            uint64_t val, node_domain = ~0ull, node_location = ~0ull;
+            while (props >> key >> val) {
+                if (key == "domain") node_domain = val;
+                if (key == "location_id") node_location = val;
+                if (key == "drm_render_minor") render_minor = val;
+            }
+            if (node_domain == domain && node_location == location) {
+                std::ifstream(node + "/gpu_id") >> gpu_id;
+            }
+        }
+
+        kfd = open("/dev/kfd", O_RDWR | O_CLOEXEC);
+        drm = open(("/dev/dri/renderD" + std::to_string(render_minor)).c_str(), O_RDWR | O_CLOEXEC);
+        kfd_ioctl_acquire_vm_args vm = {};
+        vm.drm_fd = drm;
+        vm.gpu_id = gpu_id;
+        if (kfd < 0 || drm < 0 || ioctl(kfd, AMDKFD_IOC_ACQUIRE_VM, &vm) != 0) {
+            return false;
+        }
+
+        // KFD wants the ring, wptr and rptr each in their own mapping. MES pins the wptr, so it and the ring
+        // are GTT buffers at addresses reserved here; the rptr is user memory, read back when the queue goes.
+        const size_t page = 4096;
+        char * va = (char *) mmap(nullptr, 2 * page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        void * rptr = aligned_alloc(page, page);
+        if (va == MAP_FAILED || rptr == nullptr) {
+            return false;
+        }
+        memset(rptr, 0, page);
+        char * addrs[3] = { va, va + page, (char *) rptr };
+        for (int i = 0; i < 3; i++) {
+            kfd_ioctl_alloc_memory_of_gpu_args alloc = {};
+            alloc.va_addr = (uint64_t) addrs[i];
+            alloc.size = page;
+            alloc.gpu_id = gpu_id;
+            alloc.flags = KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE | KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE;
+            if (i == 2) {
+                alloc.flags |= KFD_IOC_ALLOC_MEM_FLAGS_USERPTR;
+                alloc.mmap_offset = (uint64_t) rptr;
+            } else {
+                alloc.flags |= KFD_IOC_ALLOC_MEM_FLAGS_GTT;
+            }
+            if (ioctl(kfd, AMDKFD_IOC_ALLOC_MEMORY_OF_GPU, &alloc) != 0) {
+                return false;
+            }
+            kfd_ioctl_map_memory_to_gpu_args map = {};
+            map.handle = alloc.handle;
+            map.device_ids_array_ptr = (uint64_t) &gpu_id;
+            map.n_devices = 1;
+            if (ioctl(kfd, AMDKFD_IOC_MAP_MEMORY_TO_GPU, &map) != 0) {
+                return false;
+            }
+        }
+
+        queue_args.ring_base_address = (uint64_t) addrs[0];
+        queue_args.write_pointer_address = (uint64_t) addrs[1];
+        queue_args.read_pointer_address = (uint64_t) addrs[2];
+        queue_args.ring_size = page;
+        queue_args.gpu_id = gpu_id;
+        queue_args.queue_type = KFD_IOC_QUEUE_TYPE_SDMA;
+        queue_args.queue_percentage = 100;
+        queue_args.queue_priority = 7;
+
+        std::thread([this] { worker(); }).detach();
+        return true;
+    }
+
+    void begin() {
+        std::lock_guard<std::mutex> lock(mutex);
+        busy++;
+        last_use = now_ms();
+        // skip when COMPUTE is already active (set by hand or held by ROCm); check at most once a timeout
+        if (active || last_use - last_try < idle_timeout_ms) {
+            return;
+        }
+        last_try = last_use;
+        if (current_profile() == "COMPUTE") {
+            return;
+        }
+        kfd_ioctl_create_queue_args args = queue_args;
+        if (ioctl(kfd, AMDKFD_IOC_CREATE_QUEUE, &args) != 0) {
+            return;
+        }
+        queue_id = args.queue_id;
+        active = true;
+        if (!logged) {
+            GGML_LOG_INFO("ggml_vulkan: holding the AMD COMPUTE power profile while busy (now %s)\n", current_profile().c_str());
+            logged = true;
+        }
+        cv.notify_one();
+    }
+
+    void end() {
+        std::lock_guard<std::mutex> lock(mutex);
+        busy--;
+        last_use = now_ms();
+    }
+
+    void worker() {
+        std::unique_lock<std::mutex> lock(mutex);
+        for (;;) {
+            cv.wait(lock, [this] { return active; });
+            cv.wait_for(lock, std::chrono::milliseconds(idle_timeout_ms / 4));
+            if (busy == 0 && now_ms() - last_use >= idle_timeout_ms) {
+                kfd_ioctl_destroy_queue_args args = {};
+                args.queue_id = queue_id;
+                ioctl(kfd, AMDKFD_IOC_DESTROY_QUEUE, &args);
+                active = false;
+            }
+        }
+    }
+};
+
+// kept for the life of the process, the kernel drops the queue on exit
+static vk_amd_compute_profile * ggml_vk_amd_compute_profile_get(const std::string & pci_id) {
+    static std::mutex mutex;
+    static std::map<std::string, vk_amd_compute_profile *> profiles;
+    std::lock_guard<std::mutex> lock(mutex);
+    auto it = profiles.find(pci_id);
+    if (it == profiles.end()) {
+        vk_amd_compute_profile * p = new vk_amd_compute_profile;
+        if (!p->init(pci_id)) {
+            GGML_LOG_WARN("ggml_vulkan: GGML_VK_AMD_COMPUTE_PROFILE: no KFD access for %s, not used\n", pci_id.c_str());
+            if (p->kfd >= 0) close(p->kfd);
+            if (p->drm >= 0) close(p->drm);
+            delete p;
+            p = nullptr;
+        }
+        it = profiles.emplace(pci_id, p).first;
+    }
+    return it->second;
+}
+#endif
+
+struct vk_amd_compute_profile_scope {
+    vk_amd_compute_profile * p;
+    explicit vk_amd_compute_profile_scope(vk_amd_compute_profile * p) : p(p) {
+#ifdef GGML_VK_AMD_KFD_PROFILE
+        if (p) p->begin();
+#endif
+    }
+    ~vk_amd_compute_profile_scope() {
+#ifdef GGML_VK_AMD_KFD_PROFILE
+        if (p) p->end();
+#endif
+    }
+};
 
 static uint64_t ggml_vk_get_node_flops(const ggml_tensor * node) {
     if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
@@ -2588,6 +2807,7 @@ static void ggml_vk_check_results_1(ggml_backend_vk_context * ctx, ggml_cgraph *
 typedef void (*ggml_vk_func_t)(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 
 static void ggml_backend_vk_free(ggml_backend_t backend);
+static std::string ggml_vk_get_pci_id(vk::PhysicalDevice device);
 
 static VkDeviceSize ggml_vk_get_max_buffer_range(const ggml_backend_vk_context * ctx, const vk_buffer &buf, const VkDeviceSize offset) {
     const VkDeviceSize range = std::min(VkDeviceSize{buf->size - offset},
@@ -7107,6 +7327,12 @@ static vk_device ggml_vk_get_device(size_t idx) {
                 vkGetDeviceProcAddr(device->device, "vkGetDeviceFaultInfoEXT");
         }
 
+#ifdef GGML_VK_AMD_KFD_PROFILE
+        if (vk_amd_compute_profile_enabled && device->vendor_id == VK_VENDOR_ID_AMD) {
+            device->amd_compute_profile = ggml_vk_amd_compute_profile_get(ggml_vk_get_pci_id(device->physical_device));
+        }
+#endif
+
         // Queues
         device->compute_queue = ggml_vk_create_queue(device, compute_queue_family_index, 0, { vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer }, false);
 
@@ -7583,6 +7809,7 @@ static void ggml_vk_instance_init() {
     vk_perf_logger_enabled = getenv("GGML_VK_PERF_LOGGER") != nullptr;
     vk_perf_logger_concurrent = getenv("GGML_VK_PERF_LOGGER_CONCURRENT") != nullptr;
     vk_enable_sync_logger = getenv("GGML_VK_SYNC_LOGGER") != nullptr;
+    vk_amd_compute_profile_enabled = getenv("GGML_VK_AMD_COMPUTE_PROFILE") != nullptr;
     vk_memory_logger_enabled = getenv("GGML_VK_MEMORY_LOGGER") != nullptr;
     const char* GGML_VK_PIPELINE_STATS = getenv("GGML_VK_PIPELINE_STATS");
     if (GGML_VK_PIPELINE_STATS != nullptr) {
@@ -17249,6 +17476,7 @@ static int32_t find_first_set(uint32_t x) {
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    vk_amd_compute_profile_scope profile_scope(ctx->device->amd_compute_profile);
 
     ctx->device->diag_cgraph = nullptr;
     ctx->device->diag_prev_start = -1;
@@ -18195,8 +18423,10 @@ static vk::PhysicalDeviceType ggml_backend_vk_get_device_type(int device_idx) {
 static std::string ggml_backend_vk_get_device_pci_id(int device_idx) {
     GGML_ASSERT(device_idx >= 0 && device_idx < (int) vk_instance.device_indices.size());
 
-    vk::PhysicalDevice device = vk_instance.instance.enumeratePhysicalDevices()[vk_instance.device_indices[device_idx]];
+    return ggml_vk_get_pci_id(vk_instance.instance.enumeratePhysicalDevices()[vk_instance.device_indices[device_idx]]);
+}
 
+static std::string ggml_vk_get_pci_id(vk::PhysicalDevice device) {
     const std::vector<vk::ExtensionProperties> ext_props = device.enumerateDeviceExtensionProperties();
 
     bool ext_support = false;
