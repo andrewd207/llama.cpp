@@ -305,6 +305,36 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
     store_a(col, k_pair + 8, d * FLOAT_TYPEV2(kvalues_iq4nl[bitfieldExtract(vui, 4, 4)],
                                             kvalues_iq4nl[vui >> 12]));
 
+#elif defined(DATA_A_MXFP4) && LOAD_VEC_A > 4
+    // LOAD_VEC_A values (8 or 16) per invocation: LOAD_VEC_A / 2 bytes, low nibbles then high
+    const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+    const uint k_pair = split_k_pair(row, LOAD_VEC_A);
+
+    const uint ib = idx / (32 / LOAD_VEC_A);
+    const uint iqs = (idx % (32 / LOAD_VEC_A)) * (LOAD_VEC_A / 2);
+
+#ifdef USE_OCP_FP4
+    const float d = e8m0_to_fp32(data_a[ib].e);
+#else
+    // e2m1 code s|eem as the fp16 bits s << 15 | eem << 9 is the value / 2^14, normal or not, so
+    // decode without the shared table. Beyond 2^40 every nonzero value is inf in fp16 anyway.
+    const float d = min(e8m0_to_fp32(data_a[ib].e) * 16384.0, 1099511627776.0);
+#endif
+    [[unroll]] for (uint i = 0; i < LOAD_VEC_A / 4; i++) {
+        const uint vui = uint(data_a[ib].qs[iqs + 2 * i]);
+        const uint vui2 = uint(data_a[ib].qs[iqs + 2 * i + 1]);
+#ifdef USE_OCP_FP4
+        const u8vec2 packed = u8vec2(vui, vui2);
+        store_a(col, k_pair + i,     FLOAT_TYPEV2(bitcastExtractfe2m1EXT(packed, 0u)) * FLOAT_TYPE(d));
+        store_a(col, k_pair + i + 8, FLOAT_TYPEV2(bitcastExtractfe2m1EXT(packed, 4u)) * FLOAT_TYPE(d));
+#else
+        const uint t = vui | (vui2 << 16);
+        const uint lo = ((t & 0x00080008u) << 12) | ((t & 0x00070007u) << 9);
+        const uint hi = ((t & 0x00800080u) << 8) | ((t & 0x00700070u) << 5);
+        store_a(col, k_pair + i,     FLOAT_TYPEV2(unpackHalf2x16(lo) * d));
+        store_a(col, k_pair + i + 8, FLOAT_TYPEV2(unpackHalf2x16(hi) * d));
+#endif
+    }
 #elif defined(DATA_A_MXFP4)
     const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
     const uint k_pair = split_k_pair(row, LOAD_VEC_A);

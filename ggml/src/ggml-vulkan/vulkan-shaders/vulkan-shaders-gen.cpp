@@ -251,6 +251,9 @@ bool is_lut_quant(const std::string& type_name) {
 }
 
 std::string lut_load_vec_a(const std::string& type_name) {
+    if (type_name == "mxfp4") {
+        return "16";
+    }
     if (type_name == "iq1_s" || type_name == "iq1_m" || type_name == "iq2_xxs" || type_name == "iq2_xs" || type_name == "iq2_s" || type_name == "iq4_xs") {
         return "8";
     }
