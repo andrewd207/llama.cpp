@@ -4552,6 +4552,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         l_mmq_wg_denoms = l_wg_denoms = {128, 128, 1 };
         m_mmq_wg_denoms = m_wg_denoms = { 64,  64, 1 };
         s_mmq_wg_denoms = s_wg_denoms = { 32,  32, 1 };
+        if (device->architecture == vk_device_architecture::AMD_RDNA3 && device->coopmat_support && device->driver_id != vk::DriverId::eAmdProprietary) {
+            // 64x32 warp tiles reuse each B fragment for four rows; the medium tile carries mul_mat_id (+7% gpt-oss)
+            m_warptile_mmq = { 128, 128, 64, 32, 64, 32, 2, tm_m, tn_m, tk_m, 32 };
+            m_mmq_wg_denoms = { 128, 64, 1 };
+        }
         l_align = 128;
         m_align =  64;
         s_align =  32;
