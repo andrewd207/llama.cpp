@@ -36,6 +36,7 @@ layout(push_constant) uniform Parameters {
     // see ggml_gated_delta_net's emit_mode contract (ggml.h) and the CPU reference
     // (ggml-cpu/ops.cpp) for the exact layout.
     uint emit_mode;
+    float eps;
 };
 
 layout(binding = 0) readonly  buffer QBuf     { FLOAT_TYPE data_q[];     };
@@ -96,6 +97,36 @@ FLOAT_TYPE reduce_partial(FLOAT_TYPE partial) {
     }
 }
 
+#if L2_NORM_QK
+shared FLOAT_TYPE l2_tmp[SUBGROUP_SIZE];
+
+// sum of squares of a column, added in the order of the tree in l2_norm.comp so the result matches it
+FLOAT_TYPE l2_sum_sq(const FLOAT_TYPE v[ROWS_PER_LANE]) {
+    // rows r and r + s hold elements that are s * LANES_PER_COLUMN apart
+    precise FLOAT_TYPE sq[ROWS_PER_LANE];
+    [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+        sq[r] = v[r] * v[r];
+    }
+    [[unroll]] for (uint s = ROWS_PER_LANE / 2u; s > 0; s >>= 1u) {
+        [[unroll]] for (uint r = 0; r < s; r++) {
+            sq[r] = sq[r] + sq[r + s];
+        }
+    }
+    const uint lane = gl_SubgroupInvocationID;
+    l2_tmp[lane] = sq[0];
+    barrier();
+    [[unroll]] for (uint s = LANES_PER_COLUMN / 2u; s > 0; s >>= 1u) {
+        precise const FLOAT_TYPE sum = l2_tmp[lane] + l2_tmp[lane ^ s];
+        barrier();
+        l2_tmp[lane] = sum;
+        barrier();
+    }
+    const FLOAT_TYPE result = l2_tmp[lane];
+    barrier();
+    return result;
+}
+#endif
+
 void main() {
     const uint head_id = gl_WorkGroupID.x;
     const uint seq_id = gl_WorkGroupID.y;
@@ -155,6 +186,15 @@ void main() {
             k_reg[r] = FLOAT_TYPE(data_k[k_off + i]);
             q_reg[r] = FLOAT_TYPE(data_q[q_off + i]);
         }
+#if L2_NORM_QK
+        // q and k are the l2_norm inputs, normalized here
+        const FLOAT_TYPE k_scale = FLOAT_TYPE(1.0f) / max(sqrt(l2_sum_sq(k_reg)), FLOAT_TYPE(eps));
+        const FLOAT_TYPE q_scale = FLOAT_TYPE(1.0f) / max(sqrt(l2_sum_sq(q_reg)), FLOAT_TYPE(eps));
+        [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+            k_reg[r] *= k_scale;
+            q_reg[r] *= q_scale;
+        }
+#endif
 
         FLOAT_TYPE g_exp[ROWS_PER_LANE];
         if (KDA == 0) {
@@ -216,7 +256,7 @@ void main() {
                     if (col == 0) {
                         [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
                             const uint i = r * LANES_PER_COLUMN + lane;
-                            data_dst[ingr_base + i]          = FLOAT_TYPE(data_k[k_off + i]);
+                            data_dst[ingr_base + i]          = k_reg[r];
                             data_dst[ingr_base + 2u*S_V + i] = (KDA == 0)
                                 ? FLOAT_TYPE(data_g[gb_off])
                                 : FLOAT_TYPE(data_g[gb_off * S_V + i]); // raw, pre-exp
