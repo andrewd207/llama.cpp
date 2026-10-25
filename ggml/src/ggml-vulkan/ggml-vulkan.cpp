@@ -318,6 +318,11 @@ struct vk_command_pool {
 
     vk_queue *q;
 
+    // Pools recording a cached graph: reusable command buffers, submissions captured for replay
+    bool reusable = false;
+    bool replayable = true;
+    std::vector<vk::CommandBuffer> recorded;
+
     size_t buffers_in_use() const {
         return std::count_if(cmd_buffers.begin(), cmd_buffers.end(),
             [](const auto& cb) { return cb.in_use; });
@@ -1228,6 +1233,9 @@ static void ggml_vk_print_device_fault_info(const vk_device& device) {
     }
 }
 
+// Bumped whenever a buffer goes away; cached command buffers recorded before it may reference it.
+static std::atomic<uint64_t> vk_buffer_generation {0};
+
 struct vk_buffer_struct {
     vk::Buffer buffer = VK_NULL_HANDLE;
     vk::DeviceMemory device_memory = VK_NULL_HANDLE;
@@ -1239,6 +1247,7 @@ struct vk_buffer_struct {
     vk_device device;
 
     ~vk_buffer_struct() {
+        vk_buffer_generation++;
         if (size == 0) {
             return;
         }
@@ -2559,6 +2568,29 @@ class vk_perf_logger {
     uint32_t print_count {};
 };
 
+// Command buffers and descriptor sets of a recorded graph, resubmitted when an identical graph comes again
+struct vk_graph_cache_entry {
+    int n_nodes;
+    const ggml_tensor * first_node;
+    const ggml_tensor * last_node;
+    std::vector<uint64_t> sig;
+    uint64_t buffer_gen;
+    uint64_t last_used;
+    bool ready = false;
+    vk_command_pool pool;
+    std::vector<vk::DescriptorPool> descriptor_pools;
+    std::vector<vk::DescriptorSet> descriptor_sets;
+
+    void destroy(vk_device& device) {
+        pool.destroy(device->device);
+        for (auto& dp : descriptor_pools) {
+            device->device.destroyDescriptorPool(dp);
+        }
+        descriptor_pools.clear();
+        descriptor_sets.clear();
+    }
+};
+
 struct ggml_backend_vk_context {
     std::string name;
 
@@ -2608,6 +2640,15 @@ struct ggml_backend_vk_context {
 
     vk_command_pool compute_cmd_pool;
     vk_command_pool transfer_cmd_pool;
+
+    std::vector<std::unique_ptr<vk_graph_cache_entry>> graph_cache;
+    // dropped entries, destroyed once the queue is idle
+    std::vector<std::unique_ptr<vk_graph_cache_entry>> graph_cache_retired;
+    uint64_t graph_cache_clock {};
+    // set while recording a graph for the cache
+    vk_command_pool * graph_record_pool {};
+    // a replay ran since the last synchronize
+    bool graph_replayed {};
 
     // number of additional consecutive nodes that are being fused with the
     // node currently being processed
@@ -3456,6 +3497,21 @@ static void ggml_vk_submit(vk_context& ctx, vk::Fence fence) {
             };
             si.setPNext(&tl_submit_infos[idx]);
             submit_infos.push_back(si);
+        }
+    }
+
+    if (ctx->p->reusable) {
+        // host-side copies and signals can't be replayed; waits are added again on replay
+        if (!ctx->in_memcpys.empty() || !ctx->out_memcpys.empty() || !ctx->memsets.empty()) {
+            ctx->p->replayable = false;
+        }
+        for (const auto& sequence : ctx->seqs) {
+            for (const auto& submission : sequence) {
+                if (!submission.signal_semaphores.empty()) {
+                    ctx->p->replayable = false;
+                }
+                ctx->p->recorded.push_back(submission.buffer->buf);
+            }
         }
     }
 
@@ -8546,6 +8602,9 @@ static vk_submission ggml_vk_begin_submission(vk_device& device, vk_command_pool
     s.buffer = ggml_vk_get_or_create_cmd_buffer(device, p);
     if (one_time) {
         s.buffer->buf.begin({ vk::CommandBufferUsageFlagBits::eOneTimeSubmit });
+    } else if (p.reusable) {
+        // cached graphs can be submitted again before the previous run finished
+        s.buffer->buf.begin({ vk::CommandBufferUsageFlagBits::eSimultaneousUse });
     } else {
         s.buffer->buf.begin({ vk::CommandBufferUsageFlags{} });
     }
@@ -8626,7 +8685,7 @@ static void ggml_vk_ctx_begin(vk_device& device, vk_context& subctx) {
         ggml_vk_ctx_end(subctx);
     }
 
-    subctx->seqs.push_back({ ggml_vk_begin_submission(device, *subctx->p) });
+    subctx->seqs.push_back({ ggml_vk_begin_submission(device, *subctx->p, !subctx->p->reusable) });
     subctx->s = subctx->seqs[subctx->seqs.size() - 1].data();
 }
 
@@ -8635,7 +8694,7 @@ static vk_context ggml_vk_get_compute_ctx(ggml_backend_vk_context * ctx) {
     if (!ctx->compute_ctx.expired()) {
         result = ctx->compute_ctx.lock();
     } else {
-        result = ggml_vk_create_context(ctx, ctx->compute_cmd_pool);
+        result = ggml_vk_create_context(ctx, ctx->graph_record_pool ? *ctx->graph_record_pool : ctx->compute_cmd_pool);
 
         ctx->compute_ctx = result;
         ggml_vk_ctx_begin(ctx->device, result);
@@ -16330,6 +16389,14 @@ static void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
     ctx->gc.contexts.clear();
     ctx->pipeline_descriptor_set_requirements = 0;
     ctx->descriptor_set_idx = 0;
+
+    ctx->graph_replayed = false;
+
+    // runs after synchronize, so retired entries are no longer executing
+    for (auto& e : ctx->graph_cache_retired) {
+        e->destroy(ctx->device);
+    }
+    ctx->graph_cache_retired.clear();
 }
 
 // Clean up on backend free
@@ -16341,6 +16408,11 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     ggml_vk_synchronize(ctx);
 
     ggml_vk_graph_cleanup(ctx);
+
+    for (auto& e : ctx->graph_cache) {
+        e->destroy(ctx->device);
+    }
+    ctx->graph_cache.clear();
 
     ggml_vk_destroy_buffer(ctx->prealloc_x);
     ggml_vk_destroy_buffer(ctx->prealloc_y);
@@ -16413,6 +16485,7 @@ static void ggml_backend_vk_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_vk_buffer_context * ctx = (ggml_backend_vk_buffer_context *)buffer->context;
     ggml_vk_destroy_buffer(ctx->dev_buffer);
     delete ctx;
+    vk_buffer_generation++;
 }
 
 static void * ggml_backend_vk_buffer_get_base(ggml_backend_buffer_t buffer) {
@@ -17479,10 +17552,192 @@ static int32_t find_first_set(uint32_t x) {
     return ret;
 }
 
+static constexpr size_t vk_graph_cache_max_entries = 64;
+
+static bool ggml_vk_graph_cache_enabled(const ggml_backend_vk_context * ctx) {
+#ifdef GGML_VULKAN_CHECK_RESULTS
+    GGML_UNUSED(ctx);
+    return false;
+#else
+    static const bool disabled = getenv("GGML_VK_DISABLE_GRAPH_CACHE") != nullptr;
+    return !disabled && !vk_perf_logger_enabled && !ctx->device->serialize_submissions;
+#endif
+}
+
+// Everything the recorded commands depend on: ops, params, shapes, strides, buffers and offsets.
+// f receives each word and returns false to stop.
+template <typename F>
+static void ggml_vk_graph_visit(const ggml_cgraph * cgraph, F && f) {
+    auto tensor = [&](const ggml_tensor * t) {
+        if (!f((uint64_t)(uintptr_t)t)) {
+            return false;
+        }
+        if (t == nullptr) {
+            return true;
+        }
+        if (!f((uint64_t)(uintptr_t)t->data) || !f((uint64_t)(uintptr_t)t->buffer) ||
+            !f(((uint64_t)t->type << 40) | ((uint64_t)t->op << 8) | (uint64_t)(t->flags & 0xff))) {
+            return false;
+        }
+        for (int i = 0; i < GGML_MAX_DIMS; i++) {
+            if (!f((uint64_t)t->ne[i]) || !f((uint64_t)t->nb[i])) {
+                return false;
+            }
+        }
+        return true;
+    };
+    if (!f((uint64_t)cgraph->n_nodes)) {
+        return;
+    }
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (!tensor(node)) {
+            return;
+        }
+        uint64_t params[GGML_MAX_OP_PARAMS / sizeof(uint64_t)];
+        memcpy(params, node->op_params, sizeof(params));
+        for (uint64_t p : params) {
+            if (!f(p)) {
+                return;
+            }
+        }
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            if (!tensor(node->src[j])) {
+                return;
+            }
+        }
+    }
+}
+
+static bool ggml_vk_graph_matches(const ggml_cgraph * cgraph, const vk_graph_cache_entry & e) {
+    if (cgraph->n_nodes != e.n_nodes || cgraph->n_nodes == 0 ||
+        cgraph->nodes[0] != e.first_node || cgraph->nodes[cgraph->n_nodes - 1] != e.last_node) {
+        return false;
+    }
+    size_t idx = 0;
+    bool match = true;
+    ggml_vk_graph_visit(cgraph, [&](uint64_t v) {
+        match = idx < e.sig.size() && e.sig[idx++] == v;
+        return match;
+    });
+    return match && idx == e.sig.size();
+}
+
+// Submit work queued before the graph, so the graph's command buffers hold only its own commands
+static bool ggml_vk_flush_compute_ctx(ggml_backend_vk_context * ctx) {
+    if (ctx->compute_ctx.expired()) {
+        return true;
+    }
+    vk_context compute_ctx = ctx->compute_ctx.lock();
+    if (!compute_ctx->out_memcpys.empty()) {
+        return false;
+    }
+    ggml_vk_ctx_end(compute_ctx);
+    for (auto& cpy : compute_ctx->in_memcpys) {
+        memcpy(cpy.dst, cpy.src, cpy.n);
+    }
+    for (auto& mset : compute_ctx->memsets) {
+        memset(mset.dst, mset.val, mset.n);
+    }
+    ggml_vk_submit(compute_ctx, {});
+    ctx->submit_pending = true;
+    ctx->compute_ctx.reset();
+    return true;
+}
+
+static void ggml_vk_graph_cache_retire(ggml_backend_vk_context * ctx, size_t idx) {
+    ctx->graph_cache_retired.push_back(std::move(ctx->graph_cache[idx]));
+    ctx->graph_cache.erase(ctx->graph_cache.begin() + idx);
+}
+
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
     vk_amd_compute_profile_scope profile_scope(ctx->device->amd_compute_profile);
+
+    // Graphs repeat every token, so resubmit the command buffers of an identical earlier graph
+    vk_graph_cache_entry * record_entry = nullptr;
+    uint32_t saved_ds_idx = 0;
+    uint32_t saved_ds_req = 0;
+    if (ggml_vk_graph_cache_enabled(ctx)) {
+        ggml_vk_submit_transfer_ctx(ctx);
+        const uint64_t gen = vk_buffer_generation.load();
+        vk_graph_cache_entry * found = nullptr;
+        for (size_t i = 0; i < ctx->graph_cache.size(); i++) {
+            vk_graph_cache_entry * e = ctx->graph_cache[i].get();
+            if (ggml_vk_graph_matches(cgraph, *e)) {
+                if (e->buffer_gen == gen) {
+                    found = e;
+                } else {
+                    ggml_vk_graph_cache_retire(ctx, i);
+                }
+                break;
+            }
+        }
+        if (found) {
+            found->last_used = ++ctx->graph_cache_clock;
+            if (found->ready && ggml_vk_flush_compute_ctx(ctx)) {
+                vk::SubmitInfo si({}, {}, found->pool.recorded);
+                // wait for async uploads on the transfer queue, like the first recorded submit did
+                vk::PipelineStageFlags stage = ctx->device->compute_queue->stage_flags;
+                vk::TimelineSemaphoreSubmitInfo tl_info{ 1, &ctx->transfer_semaphore.value, 0, nullptr };
+                if (ctx->device->async_use_transfer_queue && ctx->transfer_semaphore_last_submitted < ctx->transfer_semaphore.value) {
+                    si.setWaitSemaphores(ctx->transfer_semaphore.s);
+                    si.setWaitDstStageMask(stage);
+                    si.setPNext(&tl_info);
+                    ctx->transfer_semaphore_last_submitted = ctx->transfer_semaphore.value;
+                }
+                ctx->device->compute_queue->handle->submit({ si }, {});
+                ctx->submit_pending = true;
+                ctx->graph_replayed = true;
+                if (!ctx->device->support_async) {
+                    ggml_vk_synchronize(ctx);
+                }
+                return GGML_STATUS_SUCCESS;
+            }
+        } else if (cgraph->n_nodes > 0 && ggml_vk_flush_compute_ctx(ctx)) {
+            if (ctx->graph_cache.size() >= vk_graph_cache_max_entries) {
+                size_t lru = 0;
+                for (size_t i = 1; i < ctx->graph_cache.size(); i++) {
+                    if (ctx->graph_cache[i]->last_used < ctx->graph_cache[lru]->last_used) {
+                        lru = i;
+                    }
+                }
+                ggml_vk_graph_cache_retire(ctx, lru);
+            }
+            auto e = std::make_unique<vk_graph_cache_entry>();
+            e->n_nodes = cgraph->n_nodes;
+            e->first_node = cgraph->nodes[0];
+            e->last_node = cgraph->nodes[cgraph->n_nodes - 1];
+            ggml_vk_graph_visit(cgraph, [&](uint64_t v) { e->sig.push_back(v); return true; });
+            e->buffer_gen = gen;
+            e->last_used = ++ctx->graph_cache_clock;
+            e->pool.init(ctx->device, ctx->device->compute_queue.get());
+            e->pool.reusable = true;
+            record_entry = e.get();
+            ctx->graph_cache.push_back(std::move(e));
+
+            // record into the entry's own command buffers and descriptor sets
+            ctx->graph_record_pool = &record_entry->pool;
+            std::swap(ctx->descriptor_pools, record_entry->descriptor_pools);
+            std::swap(ctx->descriptor_sets, record_entry->descriptor_sets);
+            saved_ds_idx = ctx->descriptor_set_idx;
+            saved_ds_req = ctx->pipeline_descriptor_set_requirements;
+            ctx->descriptor_set_idx = 0;
+            ctx->pipeline_descriptor_set_requirements = 0;
+
+            // a replay must not depend on barriers recorded by whatever ran before
+            vk_context first_ctx = ggml_vk_get_compute_ctx(ctx);
+            ggml_vk_sync_buffers(ctx, first_ctx);
+            ctx->graph_replayed = false;
+        }
+    }
+    if (ctx->graph_replayed) {
+        // replays don't track hazards, so order against them
+        vk_context first_ctx = ggml_vk_get_compute_ctx(ctx);
+        ggml_vk_sync_buffers(ctx, first_ctx);
+        ctx->graph_replayed = false;
+    }
 
     ctx->device->diag_cgraph = nullptr;
     ctx->device->diag_prev_start = -1;
@@ -17936,6 +18191,16 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             }
         }
         ctx->perf_logger->print_timings();
+    }
+
+    if (record_entry) {
+        ctx->graph_record_pool = nullptr;
+        std::swap(ctx->descriptor_pools, record_entry->descriptor_pools);
+        std::swap(ctx->descriptor_sets, record_entry->descriptor_sets);
+        ctx->descriptor_set_idx = saved_ds_idx;
+        ctx->pipeline_descriptor_set_requirements = saved_ds_req;
+        record_entry->ready = record_entry->pool.replayable && ctx->compute_ctx.expired() &&
+                              !record_entry->pool.recorded.empty() && record_entry->buffer_gen == vk_buffer_generation.load();
     }
 
     if (!ctx->device->support_async) {
