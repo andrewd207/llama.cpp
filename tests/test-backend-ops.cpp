@@ -32,6 +32,7 @@
 #include <cstring>
 #include <ctime>
 #include <future>
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <mutex>
@@ -42,14 +43,52 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <typeinfo>
 #include <vector>
 #include <unordered_map>
+
+#if !defined(_WIN32)
+#include <dlfcn.h>
+#include <link.h>
+#include <sys/stat.h>
+#endif
 
 #ifdef __EMSCRIPTEN__
 #   define N_THREADS 1
 #else
 #   define N_THREADS std::thread::hardware_concurrency()
 #endif
+
+// Test data is random, but seeded from the test being evaluated (see test_case::eval), so the same
+// test gets the same data in every run and its CPU reference results can be cached.
+static thread_local uint64_t t_test_seed = 0x9E3779B97F4A7C15ull;
+
+static uint64_t hash_mix(uint64_t h, uint64_t v) {
+    h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+    h *= 0xBF58476D1CE4E5B9ull;
+    return h ^ (h >> 31);
+}
+
+static uint64_t hash_str(const std::string & str) {
+    uint64_t h = 1469598103934665603ull;
+    for (unsigned char c : str) {
+        h = (h ^ c) * 1099511628211ull;
+    }
+    return h;
+}
+
+// used like a random device: returns the next seed of the current test
+struct test_seed_source {
+    uint32_t operator()() {
+        t_test_seed = hash_mix(t_test_seed, 1);
+        return (uint32_t) t_test_seed;
+    }
+};
+
+// in place of rand(), whose state is shared by all tests and threads
+static int test_rand() {
+    return (int) (test_seed_source{}() & 0x7fffffff);
+}
 
 static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     if (ggml_is_empty(tensor)) {
@@ -62,8 +101,9 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
         // parallel initialization
         static const size_t n_threads = std::max<size_t>(1, std::min<size_t>(nels/1024, std::min<size_t>(4, N_THREADS/2)));
 
+        const uint32_t seed = test_seed_source{}();
         auto init_thread = [&](size_t start, size_t end) {
-            thread_local std::default_random_engine gen(std::random_device{}());
+            std::default_random_engine gen(seed ^ (uint32_t) hash_mix(start, end));
             std::uniform_real_distribution<float> distribution(min, max);
             for (size_t i = start; i < end; i++) {
                 data[i] = distribution(gen);
@@ -156,7 +196,7 @@ static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float m
     std::vector<float>       data_f32(ne0*ne1*ne2*ne3);
     std::vector<ggml_fp16_t> data_f16(ne0*ne1*ne2*ne3);
 
-    std::random_device rd;
+    test_seed_source rd;
     std::mt19937 gen(rd());
     std::uniform_real_distribution<float> dis(min, max);
 
@@ -230,7 +270,7 @@ static void init_tensor_tril(ggml_tensor * tensor, float min = -1.0f, float max 
 
     std::vector<float> data_f32(ne0*ne1*ne2*ne3);
 
-    std::random_device rd;
+    test_seed_source rd;
     std::mt19937 gen(rd());
     std::uniform_real_distribution<float> dis(min, max);
 
@@ -1217,6 +1257,257 @@ static bool backend_lacks_skipped_ids(ggml_backend_t backend, ggml_cgraph * gf) 
     return false;
 }
 
+// Cache of the reference (backend2, usually CPU) results of test mode, so a rerun only computes
+// backend1. Entries are keyed by the test and by stamps of the CPU backend library and of this
+// file's build. Only tests whose reference took at least GGML_TEST_CACHE_MIN_MS (default 100) are
+// stored. GGML_TEST_CACHE=0 disables it, GGML_TEST_CACHE_DIR sets the directory
+// (default ~/.cache/ggml-test-backend-ops).
+static std::atomic<int> g_cache_hits{0}, g_cache_misses{0}, g_cache_stored{0};
+static std::atomic<int64_t> g_cache_ref_us{0};
+
+struct ref_cache {
+    bool enabled = false;
+    std::string dir;
+    uint64_t stamp = 0;
+    double min_ms = 100.0;
+
+    static ref_cache & get() {
+        static ref_cache cache = [] {
+            ref_cache c;
+            const char * e = getenv("GGML_TEST_CACHE");
+            if (e && atoi(e) == 0) {
+                return c;
+            }
+#if !defined(_WIN32)
+            // the CPU backend library: a rebuild of it changes the reference results
+            struct lib_info { std::string path; };
+            lib_info info;
+            dl_iterate_phdr([](struct dl_phdr_info * phdr, size_t, void * data) -> int {
+                if (phdr->dlpi_name && strstr(phdr->dlpi_name, "ggml-cpu")) {
+                    ((lib_info *) data)->path = phdr->dlpi_name;
+                    return 1;
+                }
+                return 0;
+            }, &info);
+            struct stat st;
+            if (info.path.empty() || stat(info.path.c_str(), &st) != 0) {
+                return c;
+            }
+            c.stamp = hash_mix(hash_mix(hash_str(info.path), (uint64_t) st.st_mtime), (uint64_t) st.st_size);
+            c.stamp = hash_mix(c.stamp, hash_str(__DATE__ " " __TIME__));
+
+            const char * d = getenv("GGML_TEST_CACHE_DIR");
+            const char * home = getenv("HOME");
+            if (d) {
+                c.dir = d;
+            } else if (home) {
+                c.dir = std::string(home) + "/.cache/ggml-test-backend-ops";
+            } else {
+                return c;
+            }
+            mkdir((c.dir.substr(0, c.dir.rfind('/'))).c_str(), 0755);
+            mkdir(c.dir.c_str(), 0755);
+            const char * m = getenv("GGML_TEST_CACHE_MIN_MS");
+            if (m) {
+                c.min_ms = atof(m);
+            }
+            c.enabled = true;
+#endif
+            return c;
+        }();
+        return cache;
+    }
+
+    std::string path(uint64_t key) const {
+        char name[32];
+        snprintf(name, sizeof(name), "%016" PRIx64 ".bin", hash_mix(key, stamp));
+        return dir + "/" + name;
+    }
+
+    // the data of each tensor, which must have the sizes in nbytes
+    bool load(uint64_t key, const std::vector<size_t> & nbytes, std::vector<std::vector<uint8_t>> & data) const {
+        std::ifstream f(path(key), std::ios::binary);
+        uint64_t n = 0;
+        if (!f.read((char *) &n, sizeof(n)) || n != nbytes.size()) {
+            return false;
+        }
+        data.resize(n);
+        for (size_t i = 0; i < n; i++) {
+            uint64_t size = 0;
+            if (!f.read((char *) &size, sizeof(size)) || size != nbytes[i]) {
+                return false;
+            }
+            data[i].resize(size);
+            if (!f.read((char *) data[i].data(), size)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void save(uint64_t key, const std::vector<std::vector<uint8_t>> & data) const {
+        // write to a temporary name first, parallel workers may store the same entry
+        const std::string p = path(key);
+        const std::string tmp = p + "." + std::to_string(hash_mix((uint64_t) std::hash<std::thread::id>{}(std::this_thread::get_id()), key));
+        {
+            std::ofstream f(tmp, std::ios::binary);
+            const uint64_t n = data.size();
+            f.write((const char *) &n, sizeof(n));
+            for (const auto & d : data) {
+                const uint64_t size = d.size();
+                f.write((const char *) &size, sizeof(size));
+                f.write((const char *) d.data(), size);
+            }
+            if (!f) {
+                return;
+            }
+        }
+        rename(tmp.c_str(), p.c_str());
+    }
+};
+
+// Like ggml_backend_compare_graph_backend, but backend1 runs while backend2 computes the reference,
+// and the reference comes from ref_cache when it has it.
+static bool compare_graph_backend_cached(ggml_backend_t backend1, ggml_backend_t backend2, struct ggml_cgraph * graph,
+                                         ggml_backend_eval_callback callback, void * user_data,
+                                         ggml_tensor * const * test_nodes, size_t num_test_nodes, uint64_t key) {
+    ref_cache & cache = ref_cache::get();
+
+    // graphs of a single node, for comparing node by node
+    ggml_init_params gparams = {
+        /* .mem_size = */ 2 * ggml_graph_n_nodes(graph) * ggml_graph_overhead_custom(1, false) + ggml_graph_overhead(),
+        /* .mem_base = */ NULL,
+        /* .no_alloc = */ true,
+    };
+    ggml_context_ptr gctx(ggml_init(gparams));
+    const auto node_graph = [&](ggml_tensor * node) {
+        ggml_cgraph * g = ggml_new_graph_custom(gctx.get(), 1, false);
+        ggml_graph_add_node(g, node);
+        return g;
+    };
+
+    // the nodes compared, as in ggml_backend_compare_graph_backend
+    std::vector<int> compared;
+    for (int i = 0; i < ggml_graph_n_nodes(graph); i++) {
+        ggml_tensor * t = ggml_graph_node(graph, i);
+        const bool tested = num_test_nodes == 0 ? !ggml_is_view_op(t->op) :
+                            std::find(test_nodes, test_nodes + num_test_nodes, t) != test_nodes + num_test_nodes;
+        if (tested) {
+            compared.push_back(i);
+        }
+    }
+    std::vector<size_t> nbytes;
+    for (int i : compared) {
+        nbytes.push_back(ggml_nbytes(ggml_graph_node(graph, i)));
+    }
+
+    std::vector<std::vector<uint8_t>> ref;
+    if (cache.enabled && cache.load(key, nbytes, ref)) {
+        g_cache_hits++;
+        // the reference as tensors with the layout of the compared nodes
+        ggml_init_params params = {
+            /* .mem_size = */ ggml_tensor_overhead() * (compared.size() + 1),
+            /* .mem_base = */ NULL,
+            /* .no_alloc = */ true,
+        };
+        ggml_context_ptr ctx(ggml_init(params));
+        std::vector<ggml_tensor *> refs;
+        for (int i : compared) {
+            ggml_tensor * t = ggml_graph_node(graph, i);
+            ggml_tensor * r = ggml_new_tensor(ctx.get(), t->type, GGML_MAX_DIMS, t->ne);
+            for (int d = 0; d < GGML_MAX_DIMS; d++) {
+                r->nb[d] = t->nb[d];
+            }
+            r->op = t->op;
+            refs.push_back(r);
+        }
+        ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend2));
+        if (!buf) {
+            return false;
+        }
+        for (size_t k = 0; k < compared.size(); k++) {
+            ggml_backend_tensor_set(refs[k], ref[k].data(), 0, ref[k].size());
+        }
+
+        if (num_test_nodes != 0) {
+            ggml_backend_graph_compute(backend1, graph);
+            for (size_t k = 0; k < compared.size(); k++) {
+                callback(compared[k], ggml_graph_node(graph, compared[k]), refs[k], user_data);
+            }
+        } else {
+            // each node is compared right after it is computed, before later nodes can write to it
+            size_t k = 0;
+            for (int i = 0; i < ggml_graph_n_nodes(graph); i++) {
+                ggml_backend_graph_compute(backend1, node_graph(ggml_graph_node(graph, i)));
+                if (k < compared.size() && compared[k] == i) {
+                    if (!callback(i, ggml_graph_node(graph, i), refs[k], user_data)) {
+                        break;
+                    }
+                    k++;
+                }
+            }
+        }
+        return true;
+    }
+
+    g_cache_misses++;
+    struct ggml_backend_graph_copy copy = ggml_backend_graph_copy(backend2, graph);
+    if (copy.buffer == NULL) {
+        return false;
+    }
+    struct ggml_cgraph * g1 = graph;
+    struct ggml_cgraph * g2 = copy.graph;
+    GGML_ASSERT(ggml_graph_n_nodes(g1) == ggml_graph_n_nodes(g2));
+
+    double ref_ms = 0.0;
+    const auto timed_compute = [&](struct ggml_cgraph * g) {
+        const int64_t t0 = ggml_time_us();
+        ggml_backend_graph_compute(backend2, g);
+        ref_ms += (ggml_time_us() - t0) / 1000.0;
+    };
+
+    ref.resize(compared.size());
+    const auto keep_ref = [&](size_t k) {
+        ref[k].resize(nbytes[k]);
+        ggml_backend_tensor_get(ggml_graph_node(g2, compared[k]), ref[k].data(), 0, nbytes[k]);
+    };
+
+    bool complete = true;
+    if (num_test_nodes != 0) {
+        ggml_backend_graph_compute_async(backend1, g1);
+        timed_compute(g2);
+        ggml_backend_synchronize(backend1);
+        for (size_t k = 0; k < compared.size(); k++) {
+            keep_ref(k);
+            callback(compared[k], ggml_graph_node(g1, compared[k]), ggml_graph_node(g2, compared[k]), user_data);
+        }
+    } else {
+        size_t k = 0;
+        for (int i = 0; i < ggml_graph_n_nodes(g1); i++) {
+            ggml_backend_graph_compute_async(backend1, node_graph(ggml_graph_node(g1, i)));
+            timed_compute(node_graph(ggml_graph_node(g2, i)));
+            ggml_backend_synchronize(backend1);
+            if (k < compared.size() && compared[k] == i) {
+                keep_ref(k);
+                if (!callback(i, ggml_graph_node(g1, i), ggml_graph_node(g2, i), user_data)) {
+                    complete = false;
+                    break;
+                }
+                k++;
+            }
+        }
+    }
+
+    g_cache_ref_us += (int64_t) (ref_ms * 1000);
+    if (cache.enabled && complete && ref_ms >= cache.min_ms) {
+        cache.save(key, ref);
+        g_cache_stored++;
+    }
+
+    ggml_backend_graph_copy_free(copy);
+    return true;
+}
+
 struct test_case {
     virtual ~test_case() {}
 
@@ -1405,6 +1696,8 @@ struct test_case {
                        const char *   op_names_filter,
                        printer *      output_printer) {
         mode = MODE_TEST;
+        const std::string test_id = std::string(typeid(*this).name()) + "|" + vars();
+        t_test_seed = hash_str(test_id);
 
         ggml_init_params params = {
             /* .mem_size = */ ggml_tensor_overhead()*128 + ggml_graph_overhead(),
@@ -1584,9 +1877,11 @@ struct test_case {
         if (fused_nodes_to_verify.size() == 0 && run_whole_graph()) {
             fused_nodes_to_verify.push_back(out);
         }
-        const bool cmp_ok = ggml_backend_compare_graph_backend(backend1, backend2, gf, callback, &ud,
-                                                               run_whole_graph() ? fused_nodes_to_verify.data() : nullptr,
-                                                               fused_nodes_to_verify.size());
+        const uint64_t cache_key = hash_str(test_id + "|" + current_op_name + "|" + ggml_backend_name(backend2) +
+                                            (run_whole_graph() ? "|whole" : "|nodes"));
+        const bool cmp_ok = compare_graph_backend_cached(backend1, backend2, gf, callback, &ud,
+                                                         run_whole_graph() ? fused_nodes_to_verify.data() : nullptr,
+                                                         run_whole_graph() ? fused_nodes_to_verify.size() : 0, cache_key);
 
         // Create test result
         bool        test_passed = ud.ok && cmp_ok;
@@ -2500,7 +2795,7 @@ struct test_get_rows : public test_case {
                 // rows
                 std::vector<int> data(ggml_nelements(t));
                 for (size_t i = 0; i < data.size(); i++) {
-                    data[i] = rand() % m;
+                    data[i] = test_rand() % m;
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int));
             } else {
@@ -2559,7 +2854,7 @@ struct test_get_rows_after_mul_mat : public test_case {
             if (t->type == GGML_TYPE_I32) {
                 std::vector<int> data(ggml_nelements(t));
                 for (size_t i = 0; i < data.size(); i++) {
-                    data[i] = rand() % m;
+                    data[i] = test_rand() % m;
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int));
             } else {
@@ -2654,7 +2949,7 @@ struct test_get_rows_back : public test_case {
                 // rows
                 std::vector<int> data(r*b);
                 for (int i = 0; i < r*b; i++) {
-                    data[i] = rand() % m;
+                    data[i] = test_rand() % m;
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, r * b * sizeof(int));
             } else {
@@ -2665,7 +2960,7 @@ struct test_get_rows_back : public test_case {
 };
 
 static void init_set_rows_row_ids(ggml_tensor * t, int num_rows) {
-    std::random_device rd;
+    test_seed_source rd;
     std::default_random_engine rng(rd());
     for (int i2 = 0; i2 < t->ne[2]; i2++) {
         for (int i1 = 0; i1 < t->ne[1]; i1++) {
@@ -2880,7 +3175,7 @@ struct test_rope_set_rows : public test_case {
                 const int num_pos_ids = (mode & GGML_ROPE_TYPE_MROPE) ? ne_a[2] * 4 : ne_a[2];
                 std::vector<int> data(num_pos_ids);
                 for (int i = 0; i < num_pos_ids; i++) {
-                    data[i] = rand() % n_ctx;
+                    data[i] = test_rand() % n_ctx;
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, num_pos_ids * sizeof(int));
             } else {
@@ -2987,7 +3282,7 @@ struct test_rms_norm_mul_rope : public test_case {
             } else if (t->type == GGML_TYPE_I32) {
                 std::vector<int32_t> data(ggml_nelements(t));
                 for (int32_t & value : data) {
-                    value = rand() % 512;
+                    value = test_rand() % 512;
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
             } else {
@@ -3032,7 +3327,7 @@ struct test_argmax : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        std::random_device rd;
+        test_seed_source rd;
         std::default_random_engine rng(rd());
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_F32) {
@@ -3093,7 +3388,7 @@ struct test_count_equal : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        std::random_device rd;
+        test_seed_source rd;
         std::default_random_engine rng(rd());
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_F32) {
@@ -3651,7 +3946,7 @@ struct test_add_id : public test_case {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_I32) {
                 if (ggml_is_view_op(t->op)) { continue; }
-                std::random_device rd;
+                test_seed_source rd;
                 std::default_random_engine rng(rd());
                 // ids
                 for (int64_t r = 0; r < ggml_nrows(t); r++) {
@@ -4834,7 +5129,7 @@ struct test_ssm_scan : public test_case {
 
 
     void initialize_tensors(ggml_context * ctx) override {
-        std::random_device rd;
+        test_seed_source rd;
         std::default_random_engine rng(rd());
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_I32) {
@@ -4944,7 +5239,7 @@ struct test_ssm_scan_rollback : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        std::random_device rd;
+        test_seed_source rd;
         std::default_random_engine rng(rd());
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_I32) {
@@ -5598,7 +5893,7 @@ struct test_mul_mat_w4a4 : public test_mul_mat {
 
 static void init_mul_mat_id_ids(ggml_context * ctx, int n_mats, bool skip = false) {
 
-    std::random_device rd;
+    test_seed_source rd;
     std::default_random_engine rng(rd());
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
         if (t->type != GGML_TYPE_I32 || ggml_is_view_op(t->op)) {
@@ -6553,7 +6848,7 @@ struct test_rope : public test_case {
                 const int num_pos_ids = (mode & GGML_ROPE_TYPE_MROPE) ? ne_a[2] * 4 : ne_a[2];
                 std::vector<int> data(num_pos_ids);
                 for (int i = 0; i < num_pos_ids; i++) {
-                    data[i] = rand() % n_ctx;
+                    data[i] = test_rand() % n_ctx;
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, num_pos_ids * sizeof(int));
             } else {
@@ -7213,14 +7508,14 @@ struct test_argsort : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        std::random_device rd;
+        test_seed_source rd;
         std::default_random_engine rng(rd());
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_I32) {
                 // indices
                 std::vector<int> data(ggml_nelements(t));
                 for (int i = 0; i < ggml_nelements(t); i++) {
-                    data[i] = rand();
+                    data[i] = test_rand();
                 }
                 std::shuffle(data.begin(), data.end(), rng);
                 ggml_backend_tensor_set(t, data.data(), 0, ne[0]*ne[1]*ne[2]*ne[3] * sizeof(int));
@@ -7341,7 +7636,7 @@ struct test_top_k : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        std::random_device rd;
+        test_seed_source rd;
         std::default_random_engine rng(rd());
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             int tie_denom = std::max(1, std::min(10, k / 2));
@@ -7378,7 +7673,7 @@ struct test_top_k_inf : public test_top_k {
     bool run_whole_graph() override { return true; }
 
     void initialize_tensors(ggml_context * ctx) override {
-        std::random_device rd;
+        test_seed_source rd;
         std::default_random_engine rng(rd());
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             for (int64_t r = 0; r < ggml_nrows(t); r++) {
@@ -7454,7 +7749,7 @@ struct test_topk_qsa : public test_case {
             }
             if (t->type == GGML_TYPE_I32) {
                 std::vector<int32_t> data(ggml_nelements(t));
-                for (auto & v : data) { v = rand() % n_blocks; }
+                for (auto & v : data) { v = test_rand() % n_blocks; }
                 ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
             } else if (t->type == GGML_TYPE_F16) {
                 std::vector<ggml_fp16_t> data(ggml_nelements(t));
@@ -9479,7 +9774,7 @@ struct test_generic_op : public test_case {
     void initialize_tensors(ggml_context * ctx) override {
         ggml_tensor * out = ggml_get_tensor(ctx, "out");
 
-        std::random_device rd;
+        test_seed_source rd;
         std::default_random_engine rng(rd());
 
         for (size_t i = 0; i < sources.size() && i < GGML_MAX_SRC; i++) {
@@ -9673,7 +9968,7 @@ public:
                 // pos
                 std::vector<int> data(hp.n_tokens);
                 for (int i = 0; i < hp.n_tokens; i++) {
-                    data[i] = rand() % hp.n_ctx;
+                    data[i] = test_rand() % hp.n_ctx;
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, hp.n_tokens * sizeof(int));
             } else {
@@ -13335,6 +13630,16 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
             }
         }
 
+        if (ref_cache::get().enabled) {
+            uint64_t size = 0;
+            std::error_code ec;
+            for (const auto & f : std::filesystem::directory_iterator(ref_cache::get().dir, ec)) {
+                size += f.is_regular_file(ec) ? f.file_size(ec) : 0;
+            }
+            printf("  reference cache: %d of %d tests cached, %d stored, %.1f s computing references, %.2f GB in %s\n",
+                   g_cache_hits.load(), g_cache_hits.load() + g_cache_misses.load(), g_cache_stored.load(),
+                   g_cache_ref_us.load() / 1e6, size / 1e9, ref_cache::get().dir.c_str());
+        }
         output_printer->print_summary(test_summary_info(n_ok, tests_run, false));
         output_printer->print_failed_tests(failed_tests);
 
