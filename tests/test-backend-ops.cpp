@@ -5542,6 +5542,45 @@ struct test_gated_delta_net_layer : public test_case {
     }
 };
 
+// Shared expert of a MoE layer for one token: down projection times the gate, plus the routed
+// experts' sum and the residual (some backends do the multiply in the mat-vec)
+struct test_moe_shexp_gate : public test_case {
+    const ggml_type type;
+    const int64_t n_embd;
+    const int64_t n_ff;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_SHEXP_GATE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(type, n_embd, n_ff);
+    }
+
+    test_moe_shexp_gate(ggml_type type = GGML_TYPE_F32, int64_t n_embd = 256, int64_t n_ff = 128)
+        : type(type), n_embd(n_embd), n_ff(n_ff) {}
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x        = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_ff, 1);
+        ggml_tensor * w_down   = ggml_new_tensor_2d(ctx, type, n_ff, n_embd);
+        ggml_tensor * gate     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, 1);
+        ggml_tensor * moe_out  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, 1);
+        ggml_tensor * residual = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, 1);
+
+        ggml_tensor * shexp = ggml_mul(ctx, ggml_mul_mat(ctx, w_down, x), gate);
+        ggml_tensor * out = ggml_add(ctx, ggml_add(ctx, moe_out, shexp), residual);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_GATED_DELTA_NET + GGML_OP_CPY (recurrent cache fusion)
 struct test_gated_delta_net_cache_fusion : public test_case {
     const ggml_type type;
@@ -12792,6 +12831,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_reduce(2048, 16, 32, false, true));
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
+    for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0 }) {
+        test_cases.emplace_back(new test_moe_shexp_gate(type, 256, 256));
+    }
     for (int64_t n_seq_tokens : { 1, 2 }) {
         test_cases.emplace_back(new test_gated_delta_net_layer(4, 2, 64, n_seq_tokens, 256));
         test_cases.emplace_back(new test_gated_delta_net_layer(32, 16, 128, n_seq_tokens, 512));

@@ -94,7 +94,7 @@ layout (constant_id = 1) const uint NUM_ROWS = 1;
 layout (constant_id = 2) const uint NUM_COLS = 1;
 
 #ifndef MUL_MAT_ID
-// softplus(x) * fuse1 and sigmoid(x), the gate and beta inputs of gated delta net, as the unary shaders compute them
+// softplus(x) * fuse1, sigmoid(x) and x * fuse1[0], as the unary and binary shaders compute them
 FLOAT_TYPE mat_vec_activation(const FLOAT_TYPE v, const uint i) {
     float x = float(v);
     if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SOFTPLUS_SCALE1) != 0) {
@@ -102,6 +102,9 @@ FLOAT_TYPE mat_vec_activation(const FLOAT_TYPE v, const uint i) {
     }
     if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SIGMOID) != 0) {
         x = 1.0f / (1.0f + exp(-x));
+    }
+    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE1_BCAST) != 0) {
+        x *= float(data_fuse1[0]);
     }
     return FLOAT_TYPE(x);
 }

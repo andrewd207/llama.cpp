@@ -14751,20 +14751,39 @@ static void ggml_vk_find_mmv_epilogue(ggml_backend_vk_context * ctx, ggml_cgraph
         idxs.push_back(j);
         return cgraph->nodes[j];
     };
-    // the other src of a binary op, a weight with one value per row
-    auto weight = [&](const ggml_tensor * op) -> const ggml_tensor * {
+    // the output of an earlier mat-vec's epilogue, which that mat-vec writes
+    auto written_before = [&](const ggml_tensor * v) {
+        for (const auto & it : ctx->mmv_epilogues) {
+            if (it.second.dst == v) {
+                return true;
+            }
+        }
+        return false;
+    };
+    // the other src of a binary op with ne values, computed before the mat-vec (it is read there)
+    auto operand = [&](const ggml_tensor * op, int64_t ne) -> const ggml_tensor * {
         const ggml_tensor * w = op->src[0] == cgraph->nodes[idxs[idxs.size() - 2]] ? op->src[1] : op->src[0];
-        return w->op == GGML_OP_NONE && w->type == GGML_TYPE_F32 && ggml_nelements(w) == n && ggml_is_contiguous(w) &&
-               w->buffer && get_misalign_bytes(ctx, w) == 0 ? w : nullptr;
+        if (w->type != GGML_TYPE_F32 || ggml_nelements(w) != ne || !ggml_is_contiguous(w) || !w->buffer ||
+            get_misalign_bytes(ctx, w) != 0) {
+            return nullptr;
+        }
+        for (int j = m; j < idxs.back(); j++) {
+            for (const ggml_tensor * v = w; v; v = v->view_src) {
+                if (cgraph->nodes[j] == v && !written_before(v)) {
+                    return nullptr;
+                }
+            }
+        }
+        return w;
     };
 
     vk_mmv_epilogue e {};
     const ggml_tensor * t = next(GGML_OP_ADD);
     if (t) {
-        e.fuse0 = weight(t);
+        e.fuse0 = operand(t, n);
         const ggml_tensor * sp = e.fuse0 ? next(GGML_OP_UNARY) : nullptr;
         const ggml_tensor * mul = sp && ggml_get_unary_op(sp) == GGML_UNARY_OP_SOFTPLUS ? next(GGML_OP_MUL) : nullptr;
-        e.fuse1 = mul ? weight(mul) : nullptr;
+        e.fuse1 = mul ? operand(mul, n) : nullptr;
         if (!e.fuse1) {
             return;
         }
@@ -14773,11 +14792,20 @@ static void ggml_vk_find_mmv_epilogue(ggml_backend_vk_context * ctx, ggml_cgraph
     } else {
         idxs.resize(1);
         t = next(GGML_OP_UNARY);
-        if (!t || ggml_get_unary_op(t) != GGML_UNARY_OP_SIGMOID) {
-            return;
+        if (t && ggml_get_unary_op(t) == GGML_UNARY_OP_SIGMOID) {
+            e.dst = t;
+            e.flags = MAT_VEC_FUSION_FLAGS_SIGMOID;
+        } else {
+            // times a single value, e.g. the sigmoid gate of a shared expert
+            idxs.resize(1);
+            t = next(GGML_OP_MUL);
+            e.fuse1 = t ? operand(t, 1) : nullptr;
+            if (!e.fuse1) {
+                return;
+            }
+            e.dst = t;
+            e.flags = MAT_VEC_FUSION_FLAGS_SCALE1_BCAST;
         }
-        e.dst = t;
-        e.flags = MAT_VEC_FUSION_FLAGS_SIGMOID;
     }
 
     // e.dst is written at m instead of at its own node, so nothing in between may use its memory

@@ -6,6 +6,7 @@
 #define MAT_VEC_FUSION_FLAGS_SCALE1 0x8
 #define MAT_VEC_FUSION_FLAGS_SOFTPLUS_SCALE1 0x10
 #define MAT_VEC_FUSION_FLAGS_SIGMOID 0x20
+#define MAT_VEC_FUSION_FLAGS_SCALE1_BCAST 0x40
 
 layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
 #if defined(A_TYPEV4)

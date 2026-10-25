@@ -1114,6 +1114,8 @@ typedef std::vector<vk_submission> vk_sequence;
 
 #define MAT_VEC_FUSION_FLAGS_SIGMOID 0x20
 
+#define MAT_VEC_FUSION_FLAGS_SCALE1_BCAST 0x40
+
 // GATED_DELTA_NET that also normalizes q and k: rms_norm(x, eps) * scale
 struct vk_gdn_fusion {
     const ggml_tensor * q;
