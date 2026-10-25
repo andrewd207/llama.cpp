@@ -13331,6 +13331,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 131072, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 131072, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
 
+    // decode at depth with grouped-query attention and an f16 or q8_0 KV cache
+    for (ggml_type type_kv : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+        for (int kv : { 256, 1024, 4096, 16384, 32768 }) {
+            for (auto [hs, nr] : std::initializer_list<std::pair<int, int>>{ {64, 8}, {128, 2}, {128, 4}, {256, 4} }) {
+                for (int nb : { 1, 2 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 8, {nr, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_kv, type_kv, {0, 1, 2, 3}, true));
+                }
+            }
+        }
+    }
     for (int kv : { 4096, 8192, 16384,32768, 65536, }) {
         for (int hs : { 64, 128, 256, 512, 576, }) {
             const int  hsv    = hs == 576 ? 512 : hs;
