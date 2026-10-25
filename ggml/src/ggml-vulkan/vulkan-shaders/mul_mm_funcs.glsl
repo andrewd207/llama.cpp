@@ -1,3 +1,9 @@
+// First K pair of a load row for quants that keep the low and high halves of each 32 value block
+// apart (pairs +0..7 and +8..15). Rows of later blocks in a BK > 32 tile start 16 pairs per block.
+uint split_k_pair(uint row, uint load_vec) {
+    return row * load_vec / 4 + (row / (32 / load_vec)) * 8;
+}
+
 void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uint idx_m, const uint block, const uint end_k) {
 #if defined(DATA_A_F32) || defined(DATA_A_F16)
 #if LOAD_VEC_A == 8
@@ -54,7 +60,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             }
 #elif defined(DATA_A_Q4_0)
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
-            const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_A / 4;
+            const uint buf_idx = col * SHMEM_STRIDE + split_k_pair(row, LOAD_VEC_A);
 
             const uint ib = idx / 4;
             const uint iqs = idx & 0x03;
@@ -70,7 +76,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             buf_a[buf_idx + 9] = FLOAT_TYPEV2(v1.zw);
 #elif defined(DATA_A_Q4_1)
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
-            const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_A / 4;
+            const uint buf_idx = col * SHMEM_STRIDE + split_k_pair(row, LOAD_VEC_A);
 
             const uint ib = idx / 4;
             const uint iqs = idx & 0x03;
@@ -86,7 +92,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             buf_a[buf_idx + 9 ] = FLOAT_TYPEV2(v1.zw);
 #elif defined(DATA_A_Q5_0)
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
-            const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_A / 4;
+            const uint buf_idx = col * SHMEM_STRIDE + split_k_pair(row, LOAD_VEC_A);
 
             const uint ib = idx / 8;
             const uint iqs = idx & 0x07;
@@ -103,7 +109,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             buf_a[buf_idx + 8] = FLOAT_TYPEV2(v.yw);
 #elif defined(DATA_A_Q5_1)
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
-            const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_A / 4;
+            const uint buf_idx = col * SHMEM_STRIDE + split_k_pair(row, LOAD_VEC_A);
 
             const uint ib = idx / 4;
             const uint iqs = idx & 0x03;
@@ -511,7 +517,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             buf_a[buf_idx + 1] = FLOAT_TYPEV2(v.zw);
 #elif defined(DATA_A_IQ4_NL)
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
-            const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_A / 4;
+            const uint buf_idx = col * SHMEM_STRIDE + split_k_pair(row, LOAD_VEC_A);
 
             const uint ib = idx / 8;
             const uint iqs = idx & 0x07;
@@ -526,7 +532,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 #elif defined(DATA_A_MXFP4) && LOAD_VEC_A > 4
             // LOAD_VEC_A values (8 or 16) per invocation: LOAD_VEC_A / 2 bytes, low nibbles then high
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
-            const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_A / 4;
+            const uint buf_idx = col * SHMEM_STRIDE + split_k_pair(row, LOAD_VEC_A);
 
             const uint ib = idx / (32 / LOAD_VEC_A);
             const uint iqs = (idx % (32 / LOAD_VEC_A)) * (LOAD_VEC_A / 2);
@@ -555,7 +561,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             }
 #elif defined(DATA_A_MXFP4)
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
-            const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_A / 4;
+            const uint buf_idx = col * SHMEM_STRIDE + split_k_pair(row, LOAD_VEC_A);
 
             const uint ib = idx / 8;
             const uint iqs = (idx & 0x07) * 2;
