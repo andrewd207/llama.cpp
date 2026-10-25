@@ -66,8 +66,9 @@ layout (constant_id = 11) const bool COL_UNIFORM = false;
 #define BK 32
 #define BK_STEP 2
 #define CM 16
-// int32 words per cached row: 32 int8 values, no padding (padding was slower on RADV)
-#define QS_STRIDE 8
+// int32 words per cached row: 32 int8 values and 4 words of padding, so the 16-byte row loads of
+// coopMatLoad spread over all banks
+#define QS_STRIDE 12
 
 // HAS_MIN: block value is scale * q + min, dm = (scale * d_b, min) adds dm.y * s_b
 // SPLIT16: two scales per 32 values (one per 16), dm = (scale_lo, scale_hi)
@@ -237,28 +238,30 @@ vec2 load_a_dm(const uint ib) {
 }
 #endif
 
-const uint A_LOADS = (BK_STEP * BM * 8) / BLOCK_SIZE;
-const uint B_LOADS = (BK_STEP * BN * 2) / BLOCK_SIZE;
+// one load item is half a 32-value block of A (4 words) and a whole block of B (8 words)
+const uint A_LOADS = (BK_STEP * BM * 2) / BLOCK_SIZE;
+const uint B_LOADS = (BK_STEP * BN) / BLOCK_SIZE;
 
-int32_t ra_q[A_LOADS];
+ivec4 ra_q[A_LOADS];
 vec2 ra_dm[A_LOADS];
 #ifdef INT_DOMAIN
 uint32_t ra_scm[A_LOADS];
 #endif
-ivec4 rb_q[B_LOADS];
+ivec4 rb_q[B_LOADS * 2];
 vec2 rb_ds[B_LOADS];
 
 void fetch_tiles(const uint block, const uint end_k, const uint pos_a_ib, const uint pos_b_ib, const uint ir, const uint ic) {
     [[unroll]] for (uint j = 0; j < A_LOADS; j++) {
         const uint t = gl_LocalInvocationID.x + j * BLOCK_SIZE;
-        const uint k_step = t / (BM * 8);
-        const uint row = (t / 8) % BM;
-        const uint iqs = t % 8;
+        const uint k_step = t / (BM * 2);
+        const uint row = (t / 2) % BM;
+        const uint half_i = t % 2;
         const bool ok = ir * BM + row < p.M && block + k_step * BK < end_k;
         const uint ib = pos_a_ib + row * p.stride_a / BK + k_step;
 
-        ra_q[j] = ok ? load_a_qs(ib, iqs) : 0;
-        if (iqs == 0) {
+        ra_q[j] = ok ? ivec4(load_a_qs(ib, half_i * 4), load_a_qs(ib, half_i * 4 + 1),
+                             load_a_qs(ib, half_i * 4 + 2), load_a_qs(ib, half_i * 4 + 3)) : ivec4(0);
+        if (half_i == 0) {
             ra_dm[j] = ok ? load_a_dm(ib) : vec2(0.0f);
 #ifdef INT_DOMAIN
             ra_scm[j] = ok ? load_a_scm(ib) : 0;
@@ -267,9 +270,8 @@ void fetch_tiles(const uint block, const uint end_k, const uint pos_a_ib, const 
     }
     [[unroll]] for (uint j = 0; j < B_LOADS; j++) {
         const uint t = gl_LocalInvocationID.x + j * BLOCK_SIZE;
-        const uint k_step = t / (BN * 2);
-        const uint col = (t / 2) % BN;
-        const uint half_i = t % 2;
+        const uint k_step = t / BN;
+        const uint col = t % BN;
         const bool ok = ic * BN + col < p.N && block + k_step * BK < end_k;
         const uint ib = pos_b_ib + col * p.stride_b / BK + k_step;
 
@@ -277,18 +279,17 @@ void fetch_tiles(const uint block, const uint end_k, const uint pos_a_ib, const 
         // ib counts 32-value groups: 256-value block ib / 8, group ib % 8
         const uint w = (ib / 8) * 72;
         const uint g = ib % 8;
-        rb_q[j] = ok ? ivec4(data_b32[w + g * 8 + half_i * 4], data_b32[w + g * 8 + half_i * 4 + 1],
-                             data_b32[w + g * 8 + half_i * 4 + 2], data_b32[w + g * 8 + half_i * 4 + 3]) : ivec4(0);
-        if (half_i == 0) {
-            // (scale of the 256 values, int16 sum of this group)
-            const int bsum = (data_b32[w + 64 + g / 2] << (16 * (1 - g % 2))) >> 16;
-            rb_ds[j] = ok ? vec2(intBitsToFloat(data_b32[w + 68]), float(bsum)) : vec2(0.0f);
+        [[unroll]] for (uint h = 0; h < 2; h++) {
+            rb_q[j * 2 + h] = ok ? ivec4(data_b32[w + g * 8 + h * 4], data_b32[w + g * 8 + h * 4 + 1],
+                                         data_b32[w + g * 8 + h * 4 + 2], data_b32[w + g * 8 + h * 4 + 3]) : ivec4(0);
         }
+        // (scale of the 256 values, int16 sum of this group)
+        const int bsum = (data_b32[w + 64 + g / 2] << (16 * (1 - g % 2))) >> 16;
+        rb_ds[j] = ok ? vec2(intBitsToFloat(data_b32[w + 68]), float(bsum)) : vec2(0.0f);
 #else
-        rb_q[j] = ok ? data_b[ib / 4].qs[(ib % 4) * 2 + half_i] : ivec4(0);
-        if (half_i == 0) {
-            rb_ds[j] = ok ? vec2(data_b[ib / 4].ds[ib % 4]) : vec2(0.0f);
-        }
+        rb_q[j * 2    ] = ok ? data_b[ib / 4].qs[(ib % 4) * 2    ] : ivec4(0);
+        rb_q[j * 2 + 1] = ok ? data_b[ib / 4].qs[(ib % 4) * 2 + 1] : ivec4(0);
+        rb_ds[j] = ok ? vec2(data_b[ib / 4].ds[ib % 4]) : vec2(0.0f);
 #endif
     }
 }
@@ -296,12 +297,16 @@ void fetch_tiles(const uint block, const uint end_k, const uint pos_a_ib, const 
 void store_tiles() {
     [[unroll]] for (uint j = 0; j < A_LOADS; j++) {
         const uint t = gl_LocalInvocationID.x + j * BLOCK_SIZE;
-        const uint k_step = t / (BM * 8);
-        const uint row = (t / 8) % BM;
-        const uint iqs = t % 8;
+        const uint k_step = t / (BM * 2);
+        const uint row = (t / 2) % BM;
+        const uint half_i = t % 2;
+        const uint dst = (k_step * BM + row) * QS_STRIDE + half_i * 4;
 
-        buf_a[(k_step * BM + row) * QS_STRIDE + iqs] = ra_q[j];
-        if (iqs == 0) {
+        buf_a[dst    ] = ra_q[j].x;
+        buf_a[dst + 1] = ra_q[j].y;
+        buf_a[dst + 2] = ra_q[j].z;
+        buf_a[dst + 3] = ra_q[j].w;
+        if (half_i == 0) {
             buf_a_dm[k_step * BM + row] = ra_dm[j];
 #ifdef INT_DOMAIN
             buf_a_scm[k_step * BM + row] = ra_scm[j];
@@ -310,18 +315,17 @@ void store_tiles() {
     }
     [[unroll]] for (uint j = 0; j < B_LOADS; j++) {
         const uint t = gl_LocalInvocationID.x + j * BLOCK_SIZE;
-        const uint k_step = t / (BN * 2);
-        const uint col = (t / 2) % BN;
-        const uint half_i = t % 2;
-        const uint dst = (k_step * BN + col) * QS_STRIDE + half_i * 4;
+        const uint k_step = t / BN;
+        const uint col = t % BN;
+        const uint dst = (k_step * BN + col) * QS_STRIDE;
 
-        buf_b[dst    ] = rb_q[j].x;
-        buf_b[dst + 1] = rb_q[j].y;
-        buf_b[dst + 2] = rb_q[j].z;
-        buf_b[dst + 3] = rb_q[j].w;
-        if (half_i == 0) {
-            buf_b_ds[k_step * BN + col] = rb_ds[j];
+        [[unroll]] for (uint h = 0; h < 2; h++) {
+            buf_b[dst + h * 4    ] = rb_q[j * 2 + h].x;
+            buf_b[dst + h * 4 + 1] = rb_q[j * 2 + h].y;
+            buf_b[dst + h * 4 + 2] = rb_q[j * 2 + h].z;
+            buf_b[dst + h * 4 + 3] = rb_q[j * 2 + h].w;
         }
+        buf_b_ds[k_step * BN + col] = rb_ds[j];
     }
 }
 
@@ -366,6 +370,12 @@ void main() {
         elem_r[i] = uint(pm[i]) / CM;
         elem_c[i] = uint(pm[i]) % CM;
     }
+    // AMD layout: one column per invocation, rows WARP / CM apart. A constant step lets the scale reads
+    // use immediate offsets and frees the index registers.
+    const uint elem_r0 = elem_r[0];
+    const uint elem_c0 = elem_c[0];
+#define ELEM_R(i) (COL_UNIFORM ? elem_r0 + (i) * (WARP / CM) : elem_r[i])
+#define ELEM_C(i) (COL_UNIFORM ? elem_c0 : elem_c[i])
 
     float sums[cms_per_row * cms_per_col * ELEMS];
     [[unroll]] for (uint i = 0; i < cms_per_row * cms_per_col * ELEMS; i++) {
@@ -417,10 +427,10 @@ void main() {
                 coopMatLoad(cm_b[cm_col * 2    ], buf_b, col0 * QS_STRIDE,     QS_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
                 coopMatLoad(cm_b[cm_col * 2 + 1], buf_b, col0 * QS_STRIDE + 4, QS_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
                 if (COL_UNIFORM) {
-                    d_b[cm_col * ELEMS] = buf_b_ds[col0 + elem_c[0]];
+                    d_b[cm_col * ELEMS] = buf_b_ds[col0 + elem_c0];
                 } else {
                     [[unroll]] for (uint i = 0; i < ELEMS; i++) {
-                        d_b[cm_col * ELEMS + i] = buf_b_ds[col0 + elem_c[i]];
+                        d_b[cm_col * ELEMS + i] = buf_b_ds[col0 + ELEM_C(i)];
                     }
                 }
             }
@@ -435,9 +445,9 @@ void main() {
                 coopMatLoad(cm_a[0], buf_a, row0 * QS_STRIDE,     QS_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
                 coopMatLoad(cm_a[1], buf_a, row0 * QS_STRIDE + 4, QS_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
                 [[unroll]] for (uint i = 0; i < ELEMS; i++) {
-                    d_a[i] = buf_a_dm[row0 + elem_r[i]];
+                    d_a[i] = buf_a_dm[row0 + ELEM_R(i)];
 #ifdef INT_DOMAIN
-                    const uint32_t scm = buf_a_scm[row0 + elem_r[i]];
+                    const uint32_t scm = buf_a_scm[row0 + ELEM_R(i)];
                     sc_a[i] = scm & 0xFF;
                     m_a[i] = float((scm >> 8) & 0xFF);
                     corr[cm_row * ELEMS + i] += sc_a[i];
@@ -498,8 +508,8 @@ void main() {
         [[unroll]] for (uint cm_row = 0; cm_row < cms_per_row; cm_row++) {
             const uint s = (cm_col * cms_per_row + cm_row) * ELEMS;
             [[unroll]] for (uint i = 0; i < ELEMS; i++) {
-                const uint dr = ir * BM + warp_r * WM + cm_row * CM + elem_r[i];
-                const uint dc = ic * BN + warp_c * WN + cm_col * CM + elem_c[i];
+                const uint dr = ir * BM + warp_r * WM + cm_row * CM + ELEM_R(i);
+                const uint dc = ic * BN + warp_c * WN + cm_col * CM + ELEM_C(i);
                 if (dr < p.M && dc < p.N) {
                     data_d[offsets + dc * p.stride_d + dr] = D_TYPE(sums[s + i]);
                 }
