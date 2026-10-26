@@ -18226,17 +18226,23 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         if (found) {
             found->last_used = ++ctx->graph_cache_clock;
             if (found->ready && ggml_vk_flush_compute_ctx(ctx)) {
-                vk::SubmitInfo si({}, {}, found->pool.recorded);
+                // Submit the recorded command buffers one at a time, as they were first submitted: the
+                // driver merges batches of one submit call into a single job, and a whole graph as one
+                // job can exceed the kernel's job timeout on slow GPUs (2 s by default on newer amdgpu).
                 // wait for async uploads on the transfer queue, like the first recorded submit did
                 vk::PipelineStageFlags stage = ctx->device->compute_queue->stage_flags;
                 vk::TimelineSemaphoreSubmitInfo tl_info{ 1, &ctx->transfer_semaphore.value, 0, nullptr };
-                if (ctx->device->async_use_transfer_queue && ctx->transfer_semaphore_last_submitted < ctx->transfer_semaphore.value) {
-                    si.setWaitSemaphores(ctx->transfer_semaphore.s);
-                    si.setWaitDstStageMask(stage);
-                    si.setPNext(&tl_info);
-                    ctx->transfer_semaphore_last_submitted = ctx->transfer_semaphore.value;
+                for (size_t i = 0; i < found->pool.recorded.size(); i++) {
+                    vk::SubmitInfo si(0, nullptr, nullptr, 1, &found->pool.recorded[i]);
+                    if (i == 0 && ctx->device->async_use_transfer_queue &&
+                        ctx->transfer_semaphore_last_submitted < ctx->transfer_semaphore.value) {
+                        si.setWaitSemaphores(ctx->transfer_semaphore.s);
+                        si.setWaitDstStageMask(stage);
+                        si.setPNext(&tl_info);
+                        ctx->transfer_semaphore_last_submitted = ctx->transfer_semaphore.value;
+                    }
+                    ctx->device->compute_queue->handle->submit({ si }, {});
                 }
-                ctx->device->compute_queue->handle->submit({ si }, {});
                 ctx->submit_pending = true;
                 ctx->graph_replayed = true;
                 if (!ctx->device->support_async) {
