@@ -7,13 +7,16 @@
 // ggml-backend-moe-cache.h). The scheduler owns one cache session; the
 // CPU MUL_MAT_ID path calls begin/plan/dispatch/collect/end per node.
 //
-// v1 notes:
-//   - synchronous fills (no worker thread): plan() copies missed experts
-//     into the slab before returning and serves them in this node
-//   - fills per plan are bounded by inserts_per_plan (and queue_mb)
-//   - one pool per (expert_size, wtype), allocated lazily in begin()
-//   - UMA devices (memory type DEVICE_LOCAL|HOST_VISIBLE) use direct
-//     host-mapped slabs; discrete GPUs use DEVICE_LOCAL + staging copies
+// Notes:
+//   - the budget is free VRAM minus the reserve, measured on the first node;
+//     pools (one per expert size and type) are sized after a discovery pass
+//     over all cached tensors, like the CUDA provider
+//   - misses are admitted after repeated use and filled by a worker thread;
+//     a row is served from the cache only once its fill has completed
+//   - dispatch() submits and returns, the CPU computes the misses meanwhile,
+//     collect() waits on a fence
+//   - when a DEVICE_LOCAL|HOST_VISIBLE memory type exists (UMA, resizable
+//     BAR) the slabs are filled with memcpy; otherwise through staging copies
 //   - fused SwiGLU returns NULL (stock CPU path handles the node)
 //
 // Register by calling ggml_vulkan_moe_cache_register() from
@@ -166,16 +169,46 @@ struct moe_cache_vulkan_device : public moe_cache_device {
     // slab buffer per pool (parallel to pools)
     std::vector<vk_buf> pool_buffers;
 
-    // scratch buffers
+    // scratch buffers, in host memory: the CPU writes ids/activations and
+    // reads results, so device-local (BAR) memory would make the reads uncached
     vk_buf ids_buf;
     vk_buf act_buf;
     vk_buf out_buf;
     vk_buf params_buf;
-    vk_buf staging;      // host-visible, transfer src+dst
-    std::vector<float> h_act; // host scratch for quantized activations
-    size_t h_act_cap_bytes = 0;
+
+    // dispatch runs asynchronously while the CPU computes the misses;
+    // collect waits for this fence
+    VkCommandBuffer dispatch_cmd = VK_NULL_HANDLE;
+    VkFence dispatch_fence = VK_NULL_HANDLE;
+    bool dispatch_pending = false;
+    // threads that share one output row must fit in the smallest subgroup
+    uint32_t max_threads_per_row = 1;
+
+    // fill worker: own command pool, fence and staging (device-local slabs only)
+    VkCommandPool worker_cmd_pool = VK_NULL_HANDLE;
+    VkCommandBuffer worker_cmd = VK_NULL_HANDLE;
+    VkFence worker_fence = VK_NULL_HANDLE;
+    vk_buf worker_staging;
 
     void free_resources() {
+        if (dispatch_fence) {
+            if (dispatch_pending) {
+                vkWaitForFences(vk_device, 1, &dispatch_fence, VK_TRUE, UINT64_MAX);
+                dispatch_pending = false;
+            }
+            vkDestroyFence(vk_device, dispatch_fence, nullptr);
+            dispatch_fence = VK_NULL_HANDLE;
+        }
+        if (worker_fence) {
+            vkDestroyFence(vk_device, worker_fence, nullptr);
+            worker_fence = VK_NULL_HANDLE;
+        }
+        if (worker_cmd_pool) {
+            vkDestroyCommandPool(vk_device, worker_cmd_pool, nullptr);
+            worker_cmd_pool = VK_NULL_HANDLE;
+            worker_cmd = VK_NULL_HANDLE;
+        }
+        destroy_buf(worker_staging);
         for (auto & buf : pool_buffers) {
             destroy_buf(buf);
         }
@@ -184,7 +217,6 @@ struct moe_cache_vulkan_device : public moe_cache_device {
         destroy_buf(act_buf);
         destroy_buf(out_buf);
         destroy_buf(params_buf);
-        destroy_buf(staging);
 
         if (ds_pool) {
             vkDestroyDescriptorPool(vk_device, ds_pool, nullptr);
@@ -224,6 +256,7 @@ struct moe_cache_vulkan_device : public moe_cache_device {
         if (vk_cmd_pool) {
             vkDestroyCommandPool(vk_device, vk_cmd_pool, nullptr);
             vk_cmd_pool = VK_NULL_HANDLE;
+            dispatch_cmd = VK_NULL_HANDLE;
         }
         for (auto & pool : pools) {
             pool->slab = nullptr;
@@ -347,112 +380,13 @@ static bool vk_buf_reserve(moe_cache_vulkan_device & dev, vk_buf & buf,
     return true;
 }
 
-// Submit one one-time command buffer and wait for it.
-template <typename F>
-static bool vk_submit_and_wait(moe_cache_vulkan_device & dev, F record) {
-    // The backend can hand multiple contexts the same VkQueue. Vulkan requires
-    // host access to that queue to be externally synchronized, including
-    // vkQueueWaitIdle. Use the backend's queue lock so cache submissions also
-    // serialize with normal graph submissions and with other cache sessions.
-    ggml_backend_vk_lock_queue(dev.vk_backend);
-    struct queue_unlock {
-        ggml_backend_t backend;
-        ~queue_unlock() { ggml_backend_vk_unlock_queue(backend); }
-    } unlock{dev.vk_backend};
-
-    VkCommandBufferAllocateInfo ai = {};
-    ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    ai.commandPool = dev.vk_cmd_pool;
-    ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    ai.commandBufferCount = 1;
-
-    VkCommandBuffer cmd = VK_NULL_HANDLE;
-    if (vkAllocateCommandBuffers(dev.vk_device, &ai, &cmd) != VK_SUCCESS) {
-        return false;
-    }
-
-    VkCommandBufferBeginInfo bi = {};
-    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-
-    bool ok = vkBeginCommandBuffer(cmd, &bi) == VK_SUCCESS;
-    if (ok) {
-        ok = record(cmd);
-    }
-    if (ok) {
-        ok = vkEndCommandBuffer(cmd) == VK_SUCCESS;
-    }
-    if (ok) {
-        VkSubmitInfo si = {};
-        si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        si.commandBufferCount = 1;
-        si.pCommandBuffers = &cmd;
-        ok = vkQueueSubmit(dev.vk_queue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS;
-    }
-    if (ok) {
-        ok = vkQueueWaitIdle(dev.vk_queue) == VK_SUCCESS;
-    }
-    vkFreeCommandBuffers(dev.vk_device, dev.vk_cmd_pool, 1, &cmd);
-    return ok;
-}
-
-// Copy host data into a buffer. Direct memcpy when the buffer is
-// host-visible; otherwise stage through the shared staging buffer.
-static bool vk_buf_upload(moe_cache_vulkan_device & dev, vk_buf & buf,
-                          VkDeviceSize offset, const void * src, VkDeviceSize bytes) {
-    if (bytes == 0) {
-        return true;
-    }
-    if (buf.host_visible) {
-        memcpy((char *)buf.mapped + offset, src, bytes);
-        return true;
-    }
-    if (!vk_buf_reserve(dev, dev.staging, bytes,
-                        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
-        return false;
-    }
-    memcpy(dev.staging.mapped, src, bytes);
-    return vk_submit_and_wait(dev, [&](VkCommandBuffer cmd) {
-        VkBufferCopy region = {};
-        region.srcOffset = 0;
-        region.dstOffset = offset;
-        region.size = bytes;
-        vkCmdCopyBuffer(cmd, dev.staging.buffer, buf.buffer, 1, &region);
-        return true;
-    });
-}
-
-// Copy device data back to host. Direct memcpy when the buffer is
-// host-visible; otherwise stage through the shared staging buffer.
-static bool vk_buf_download(moe_cache_vulkan_device & dev, vk_buf & buf,
-                            VkDeviceSize offset, void * dst, VkDeviceSize bytes) {
-    if (bytes == 0) {
-        return true;
-    }
-    if (buf.host_visible) {
-        memcpy(dst, (const char *)buf.mapped + offset, bytes);
-        return true;
-    }
-    if (!vk_buf_reserve(dev, dev.staging, bytes,
-                        VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
-        return false;
-    }
-    if (!vk_submit_and_wait(dev, [&](VkCommandBuffer cmd) {
-        VkBufferCopy region = {};
-        region.srcOffset = offset;
-        region.dstOffset = 0;
-        region.size = bytes;
-        vkCmdCopyBuffer(cmd, buf.buffer, dev.staging.buffer, 1, &region);
-        return true;
-    })) {
-        return false;
-    }
-    memcpy(dst, dev.staging.mapped, bytes);
-    return true;
+// Host-memory scratch that the CPU reads back: prefer a cached memory type.
+static bool vk_buf_reserve_host(moe_cache_vulkan_device & dev, vk_buf & buf,
+                                VkDeviceSize required, VkBufferUsageFlags usage) {
+    const VkMemoryPropertyFlags coherent =
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    return vk_buf_reserve(dev, buf, required, usage, coherent | VK_MEMORY_PROPERTY_HOST_CACHED_BIT) ||
+           vk_buf_reserve(dev, buf, required, usage, coherent);
 }
 
 // ---------------------------------------------------------------------------
@@ -586,7 +520,7 @@ static bool vk_load_pipelines(moe_cache_vulkan_device & dev) {
 // Create the command pool and compile the moe-cache pipelines on first use.
 // session_create only keeps bookkeeping state, so a context that never uses
 // the cache pays no GPU setup cost.
-static bool vk_device_ensure_ready(moe_cache_vulkan_device & dev, size_t budget_mb) {
+static bool vk_device_ensure_ready(moe_cache_vulkan_device & dev) {
     std::call_once(dev.init_once, [&]() {
         VkCommandPoolCreateInfo cpci = {};
         cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -596,6 +530,35 @@ static bool vk_device_ensure_ready(moe_cache_vulkan_device & dev, size_t budget_
             dev.dead.store(true);
             return;
         }
+        VkCommandBufferAllocateInfo ai = {};
+        ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        ai.commandPool = dev.vk_cmd_pool;
+        ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        ai.commandBufferCount = 1;
+        VkFenceCreateInfo fci = {};
+        fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        if (vkAllocateCommandBuffers(dev.vk_device, &ai, &dev.dispatch_cmd) != VK_SUCCESS ||
+            vkCreateFence(dev.vk_device, &fci, nullptr, &dev.dispatch_fence) != VK_SUCCESS) {
+            dev.dead.store(true);
+            return;
+        }
+        VkPhysicalDeviceSubgroupSizeControlProperties size_control = {};
+        size_control.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES;
+        VkPhysicalDeviceSubgroupProperties subgroup = {};
+        subgroup.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
+        subgroup.pNext = &size_control;
+        VkPhysicalDeviceProperties2 props2 = {};
+        props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+        props2.pNext = &subgroup;
+        vkGetPhysicalDeviceProperties2(dev.vk_physical, &props2);
+        uint32_t min_subgroup = subgroup.subgroupSize;
+        if (size_control.minSubgroupSize > 0) {
+            min_subgroup = std::min(min_subgroup, size_control.minSubgroupSize);
+        }
+        if ((subgroup.supportedOperations & VK_SUBGROUP_FEATURE_SHUFFLE_BIT) &&
+            (subgroup.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT)) {
+            dev.max_threads_per_row = std::max<uint32_t>(1, std::min<uint32_t>(32, min_subgroup));
+        }
         if (!vk_load_pipelines(dev)) {
             MOE_CACHE_LOG("[moe-cache] Vulkan pipeline creation failed\n");
             dev.free_resources();
@@ -603,8 +566,8 @@ static bool vk_device_ensure_ready(moe_cache_vulkan_device & dev, size_t budget_
             return;
         }
         dev.init_ok = true;
-        MOE_CACHE_LOG("[moe-cache] Vulkan session ready (budget=%zu MiB, %s)\n",
-                budget_mb, dev.host_mapped ? "host-mapped" : "device-local");
+        MOE_CACHE_LOG("[moe-cache] Vulkan session ready (%s slabs)\n",
+                dev.host_mapped ? "host-mapped" : "device-local");
     });
     return dev.init_ok;
 }
@@ -658,6 +621,11 @@ static int vk_moe_query_config(int automatic, size_t budget_mib,
     }
     if (budget_mib > 0) {
         config.budget_mb = budget_mib;
+    }
+    // the 1 MiB floor is for CUDA's pre-Ampere kernels; the Vulkan matvec
+    // takes the smaller experts in either mode
+    if (!config.min_expert_explicit) {
+        config.min_expert_bytes = moe_cache_expert_bytes_ampere_min;
     }
     if (!config.enabled || config.budget_mb > (SIZE_MAX >> 20) ||
         config.reserve_mb > (SIZE_MAX >> 20)) {
@@ -735,36 +703,205 @@ static int vk_moe_query_shape(int wtype, int64_t n_in, int64_t n_out,
 // Pool lifecycle
 // ---------------------------------------------------------------------------
 
-static moe_cache_pool * vk_moe_find_or_create_pool(
-        moe_cache_vulkan_device & dev, moe_cache_session & session,
-        size_t expert_size, int wtype, int64_t n_expert, size_t budget_bytes) {
-    const int existing = moe_cache_find_pool(dev, expert_size, wtype);
-    if (existing >= 0) {
-        return dev.pools[existing].get();
+// Free VRAM minus the reserve, measured on the first cached node, once the
+// model, KV cache and compute buffers are allocated.
+static bool vk_moe_prepare_budget(moe_cache_session & session, moe_cache_vulkan_device & dev) {
+    if (dev.budget_ready) {
+        return dev.budget_limit > 0;
     }
+    dev.budget_ready = true;
 
-    if (moe_cache_fail(session, "slab")) {
-        MOE_CACHE_LOG("[moe-cache] Vulkan: skipped %zu KiB expert pool: allocation failed\n",
-                expert_size >> 10);
-        return nullptr;
+    size_t free_memory = 0;
+    size_t total_memory = 0;
+    ggml_backend_dev_memory(ggml_backend_get_device(dev.vk_backend), &free_memory, &total_memory);
+
+    const size_t reserve_bytes = session.config.reserve_mb << 20;
+    size_t available = free_memory > reserve_bytes ? free_memory - reserve_bytes : 0;
+    if (session.config.budget_mb > 0) {
+        available = std::min(available, session.config.budget_mb << 20);
     }
+    dev.budget_limit = available;
 
-    size_t slots = budget_bytes / expert_size;
+    if (session.config.budget_mb > 0) {
+        MOE_CACHE_LOG("[moe-cache] Vulkan%d capacity: cap=%zu MiB granted=%zu MiB free=%zu MiB reserve=%zu MiB\n",
+                dev.physical, session.config.budget_mb, available >> 20,
+                free_memory >> 20, reserve_bytes >> 20);
+    } else {
+        MOE_CACHE_LOG("[moe-cache] Vulkan%d capacity: policy=free-minus-reserve granted=%zu MiB free=%zu MiB reserve=%zu MiB\n",
+                dev.physical, available >> 20, free_memory >> 20, reserve_bytes >> 20);
+    }
+    return available > 0;
+}
+
+// Copy one expert into its slot. Host-mapped slabs take a plain memcpy;
+// device-local slabs go through the worker's staging buffer.
+static bool vk_moe_fill_slot(moe_cache_vulkan_device & dev, vk_buf & slab_buf, char * slab,
+                             size_t offset, const void * source, size_t bytes) {
+    if (slab) {
+        memcpy(slab + offset, source, bytes);
+        // drain write-combining buffers before the slot is published
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        return true;
+    }
+    if (!dev.worker_cmd_pool) {
+        VkCommandPoolCreateInfo cpci = {};
+        cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        cpci.queueFamilyIndex = dev.vk_queue_family;
+        VkCommandBufferAllocateInfo ai = {};
+        ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        ai.commandBufferCount = 1;
+        VkFenceCreateInfo fci = {};
+        fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        if (vkCreateCommandPool(dev.vk_device, &cpci, nullptr, &dev.worker_cmd_pool) != VK_SUCCESS) {
+            return false;
+        }
+        ai.commandPool = dev.worker_cmd_pool;
+        if (vkAllocateCommandBuffers(dev.vk_device, &ai, &dev.worker_cmd) != VK_SUCCESS ||
+            vkCreateFence(dev.vk_device, &fci, nullptr, &dev.worker_fence) != VK_SUCCESS) {
+            return false;
+        }
+    }
+    if (!vk_buf_reserve(dev, dev.worker_staging, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+        return false;
+    }
+    memcpy(dev.worker_staging.mapped, source, bytes);
+
+    VkCommandBufferBeginInfo bi = {};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkResetCommandBuffer(dev.worker_cmd, 0) != VK_SUCCESS ||
+        vkBeginCommandBuffer(dev.worker_cmd, &bi) != VK_SUCCESS) {
+        return false;
+    }
+    VkBufferCopy region = {};
+    region.dstOffset = offset;
+    region.size = bytes;
+    vkCmdCopyBuffer(dev.worker_cmd, dev.worker_staging.buffer, slab_buf.buffer, 1, &region);
+    if (vkEndCommandBuffer(dev.worker_cmd) != VK_SUCCESS) {
+        return false;
+    }
+    VkSubmitInfo si = {};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &dev.worker_cmd;
+    VkResult result;
+    {
+        ggml_backend_vk_lock_queue(dev.vk_backend);
+        result = vkQueueSubmit(dev.vk_queue, 1, &si, dev.worker_fence);
+        ggml_backend_vk_unlock_queue(dev.vk_backend);
+    }
+    if (result != VK_SUCCESS) {
+        return false;
+    }
+    result = vkWaitForFences(dev.vk_device, 1, &dev.worker_fence, VK_TRUE, UINT64_MAX);
+    vkResetFences(dev.vk_device, 1, &dev.worker_fence);
+    return result == VK_SUCCESS;
+}
+
+// Fills queued experts off the critical path; a slot becomes a hit only after
+// its copy has finished.
+static void vk_moe_worker(moe_cache_session * session, moe_cache_vulkan_device * dev) {
+    for (;;) {
+        moe_cache_job job;
+        vk_buf slab_buf;
+        bool has_slot = false;
+        char * slab = nullptr;
+        {
+            std::unique_lock<std::mutex> lock(session->mu);
+            session->cv.wait(lock, [&] {
+                return session->stopping || dev->dead.load() || !dev->queue.empty();
+            });
+            if ((session->stopping || dev->dead.load()) && dev->queue.empty()) {
+                break;
+            }
+            job = dev->queue.front();
+            dev->queue.pop_front();
+            dev->queued_bytes = job.bytes <= dev->queued_bytes ? dev->queued_bytes - job.bytes : 0;
+            dev->inflight = true;
+            dev->inflight_source = job.source;
+            dev->inflight_bytes = job.bytes;
+            if (job.pool >= 0 && job.pool < (int)dev->pools.size() &&
+                job.slot >= 0 && job.slot < dev->pools[job.pool]->n_slots) {
+                slab_buf = dev->pool_buffers[job.pool];
+                slab = dev->pools[job.pool]->slab;
+                has_slot = true;
+            }
+        }
+
+        bool ok = has_slot && !dev->dead.load() && !moe_cache_fail(*session, "insert") &&
+            vk_moe_fill_slot(*dev, slab_buf, slab, (size_t)job.slot * job.bytes, job.source, job.bytes);
+
+        {
+            std::lock_guard<std::mutex> lock(session->mu);
+            dev->inflight = false;
+            dev->inflight_source = nullptr;
+            dev->inflight_bytes = 0;
+            if (has_slot) {
+                moe_cache_pool & pool = *dev->pools[job.pool];
+                moe_cache_slot & slot = pool.slots[job.slot];
+                if (slot.state == moe_cache_slot_state::copying &&
+                    slot.generation == job.generation && slot.key == job.key) {
+                    if (ok) {
+                        slot.state = moe_cache_slot_state::valid;
+                        moe_cache_lru_push_back(pool, job.slot);
+                        dev->demand_count.erase(job.key);
+                        dev->fills++;
+                    } else {
+                        moe_cache_slot_reset(pool, job.slot, true);
+                        dev->fill_failures++;
+                    }
+                }
+            }
+            session->idle_cv.notify_all();
+        }
+        if (!ok && has_slot && !slab) {
+            dev->dead.store(true);
+            MOE_CACHE_LOG("[moe-cache] Vulkan%d: staged fill failed; disabled the device cache\n", dev->physical);
+        }
+    }
+}
+
+static bool vk_moe_start_worker(moe_cache_session & session, moe_cache_vulkan_device & dev) {
+    if (dev.worker_started) {
+        return true;
+    }
+    try {
+        dev.worker = std::thread(vk_moe_worker, &session, &dev);
+        dev.worker_started = true;
+        return true;
+    } catch (...) {
+        dev.dead.store(true);
+        MOE_CACHE_LOG("[moe-cache] Vulkan%d failed to start fill worker\n", dev.physical);
+        return false;
+    }
+}
+
+static bool vk_moe_allocate_pool(moe_cache_session & session, moe_cache_vulkan_device & dev,
+                                 moe_cache_shape & shape, size_t budget) {
+    if (shape.expert_size == 0 || shape.n_tensors <= 0 || shape.n_entries == 0) {
+        return false;
+    }
+    shape.finished = true;
+
+    size_t slots = std::min<size_t>(budget / shape.expert_size,
+                                    (size_t)std::min<uint64_t>(shape.n_entries, INT_MAX));
+    // the shader binds the whole slab as one storage buffer
+    VkPhysicalDeviceMaintenance3Properties maint3 = {};
+    maint3.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES;
+    VkPhysicalDeviceProperties2 props2 = {};
+    props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    props2.pNext = &maint3;
+    vkGetPhysicalDeviceProperties2(dev.vk_physical, &props2);
+    const uint64_t max_slab = std::min<uint64_t>(props2.properties.limits.maxStorageBufferRange,
+                                                 maint3.maxMemoryAllocationSize);
+    slots = std::min<size_t>(slots, max_slab / shape.expert_size);
     if (slots < moe_cache_pool_slots_min) {
-        return nullptr;
+        return false;
     }
-    if ((uint64_t)n_expert > 0 && slots > (size_t)n_expert) {
-        slots = (size_t)n_expert;
-    }
-    if (slots < moe_cache_pool_slots_min) {
-        return nullptr;
-    }
-    if (slots > (size_t)INT_MAX) {
-        slots = INT_MAX;
-    }
-    const size_t slab_bytes = slots * expert_size;
 
-    vk_buf slab_buf;
     VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     VkMemoryPropertyFlags props = dev.host_mapped
         ? (VkMemoryPropertyFlags)(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
@@ -774,43 +911,182 @@ static moe_cache_pool * vk_moe_find_or_create_pool(
     if (!dev.host_mapped) {
         usage |= VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     }
-    if (!vk_buf_create(dev, slab_bytes, usage, props, slab_buf)) {
-        MOE_CACHE_LOG("[moe-cache] Vulkan: failed to allocate %zu MiB expert pool\n",
-                slab_bytes >> 20);
-        return nullptr;
+    vk_buf slab_buf;
+    bool allocated = false;
+    while (slots >= moe_cache_pool_slots_min) {
+        if (!moe_cache_fail(session, "slab") &&
+            vk_buf_create(dev, slots * shape.expert_size, usage, props, slab_buf)) {
+            allocated = true;
+            break;
+        }
+        slots /= 2;
     }
+    if (!allocated) {
+        MOE_CACHE_LOG("[moe-cache] Vulkan%d skipped %zu KiB expert pool: allocation failed\n",
+                dev.physical, shape.expert_size >> 10);
+        return false;
+    }
+    const size_t slab_bytes = slots * shape.expert_size;
 
     try {
         std::unique_ptr<moe_cache_pool> pool(new moe_cache_pool());
-        pool->expert_size = expert_size;
-        pool->wtype = wtype;
+        pool->expert_size = shape.expert_size;
+        pool->wtype = shape.wtype;
         pool->slab = dev.host_mapped ? (char *)slab_buf.mapped : nullptr;
         pool->n_slots = (int)slots;
-        pool->covers_all_entries = (uint64_t)slots >= (uint64_t)n_expert;
+        pool->covers_all_entries = (uint64_t)slots >= shape.n_entries;
         pool->slots.resize(slots);
         pool->free_slots.reserve(slots);
         pool->map.reserve(slots);
         for (int index = (int)slots - 1; index >= 0; index--) {
             pool->free_slots.push_back(index);
         }
-        dev.allocated_bytes += slab_bytes;
         dev.pools.push_back(std::move(pool));
         dev.pool_buffers.push_back(slab_buf);
-        MOE_CACHE_LOG("[moe-cache] Vulkan%d pool[%d]: type=%s expert=%zu KiB slots=%zu entries=%lld coverage=%s total=%zu MiB\n",
-                dev.physical, (int)dev.pools.size() - 1,
-                ggml_type_name((ggml_type)wtype), expert_size >> 10,
-                slots, (long long)n_expert,
-                dev.pools.back()->covers_all_entries ? "complete" : "partial",
-                slab_bytes >> 20);
-        bool expected = false;
-        if (session.enabled_announced.compare_exchange_strong(expected, true)) {
-            MOE_CACHE_LOG("[moe-cache] enabled: first pool allocated on Vulkan%d\n",
-                    dev.physical);
-        }
-        return dev.pools.back().get();
     } catch (...) {
         vk_buf_destroy(dev, slab_buf);
-        return nullptr;
+        return false;
+    }
+    shape.pool = (int)dev.pools.size() - 1;
+    dev.allocated_bytes += slab_bytes;
+
+    if (!vk_moe_start_worker(session, dev)) {
+        return false;
+    }
+
+    MOE_CACHE_LOG("[moe-cache] Vulkan%d pool[%d]: type=%s expert=%zu KiB slots=%zu entries=%llu coverage=%s total=%zu MiB\n",
+            dev.physical, shape.pool, ggml_type_name((ggml_type)shape.wtype),
+            shape.expert_size >> 10, slots, (unsigned long long)shape.n_entries,
+            dev.pools.back()->covers_all_entries ? "complete" : "partial", slab_bytes >> 20);
+    bool expected = false;
+    if (session.enabled_announced.compare_exchange_strong(expected, true)) {
+        MOE_CACHE_LOG("[moe-cache] enabled: first pool allocated on Vulkan%d\n", dev.physical);
+    }
+    return true;
+}
+
+// Split the budget between the discovered shapes by their total expert bytes,
+// giving each pool at least the minimum slot count when the budget allows.
+static void vk_moe_build_pending(moe_cache_session & session, moe_cache_vulkan_device & dev) {
+    size_t remaining = dev.budget_limit > dev.allocated_bytes ? dev.budget_limit - dev.allocated_bytes : 0;
+    if (remaining == 0) {
+        for (moe_cache_shape & shape : dev.shapes) {
+            if (shape.n_tensors > 0) {
+                shape.finished = true;
+            }
+        }
+        return;
+    }
+
+    std::vector<moe_cache_shape *> pending;
+    long double total_weight = 0.0;
+    size_t minimum_remaining = 0;
+    for (moe_cache_shape & shape : dev.shapes) {
+        if (!shape.finished && shape.n_tensors > 0) {
+            pending.push_back(&shape);
+            total_weight += (long double)shape.expert_size * (long double)shape.n_tensors;
+            minimum_remaining += shape.expert_size * moe_cache_pool_slots_min;
+        }
+    }
+    std::sort(pending.begin(), pending.end(), [](const auto * lhs, const auto * rhs) {
+        return (long double)lhs->expert_size * lhs->n_tensors > (long double)rhs->expert_size * rhs->n_tensors;
+    });
+
+    auto weighted_share = [](size_t available, long double weight, long double total) {
+        if (available == 0 || weight <= 0.0 || total <= 0.0) {
+            return (size_t)0;
+        }
+        const long double value = (long double)available * weight / total;
+        return value >= (long double)available ? available : (size_t)value;
+    };
+    const bool complete_pools = minimum_remaining <= remaining;
+    for (moe_cache_shape * shape : pending) {
+        const long double weight = (long double)shape->expert_size * (long double)shape->n_tensors;
+        const size_t minimum = shape->expert_size * moe_cache_pool_slots_min;
+        size_t share = weighted_share(remaining, weight, total_weight);
+        if (complete_pools) {
+            share = minimum + weighted_share(remaining - minimum_remaining, weight, total_weight);
+        } else if (share < minimum && remaining >= minimum) {
+            share = minimum;
+        }
+        const size_t before = dev.allocated_bytes;
+        vk_moe_allocate_pool(session, dev, *shape, share);
+        const size_t consumed = dev.allocated_bytes - before;
+        remaining = consumed <= remaining ? remaining - consumed : 0;
+        total_weight -= weight;
+        if (complete_pools) {
+            minimum_remaining -= minimum;
+        }
+    }
+}
+
+// Pools are sized once every cached tensor has been seen: a full round of
+// visits without a new tensor ends the discovery pass.
+static int vk_moe_discover_pool(moe_cache_session & session, moe_cache_vulkan_device & dev,
+                                const void * host_base, size_t tensor_size, size_t expert_size,
+                                int wtype, int64_t n_expert) {
+    int pool = moe_cache_find_pool(dev, expert_size, wtype);
+    if (pool >= 0 && (!dev.pools[pool]->covers_all_entries ||
+                      dev.seen_tensors.find(host_base) != dev.seen_tensors.end())) {
+        return pool;
+    }
+
+    moe_cache_shape * shape = nullptr;
+    for (moe_cache_shape & candidate : dev.shapes) {
+        if (candidate.expert_size == expert_size && candidate.wtype == wtype) {
+            shape = &candidate;
+            break;
+        }
+    }
+    if (!shape) {
+        dev.shapes.push_back({expert_size, wtype, 0, 0, -1, false});
+        shape = &dev.shapes.back();
+        shape->pool = pool;
+    }
+
+    const bool first_visit = dev.seen_tensors.emplace(
+            host_base, moe_cache_seen_tensor{tensor_size, expert_size, wtype, n_expert}).second;
+    if (first_visit) {
+        if (shape->n_tensors == 0 && shape->pool < 0) {
+            shape->finished = false;
+        }
+        shape->n_entries += (uint64_t)n_expert;
+        shape->n_tensors++;
+        dev.visits_since_new_tensor = 0;
+    } else if (dev.visits_since_new_tensor < SIZE_MAX) {
+        dev.visits_since_new_tensor++;
+    }
+
+    if (pool >= 0) {
+        dev.pools[pool]->covers_all_entries = (uint64_t)dev.pools[pool]->n_slots >= shape->n_entries;
+        return pool;
+    }
+    if (dev.visits_since_new_tensor < dev.seen_tensors.size()) {
+        return -1;
+    }
+    vk_moe_build_pending(session, dev);
+    return moe_cache_find_pool(dev, expert_size, wtype);
+}
+
+// Drop queued fills whose source overlaps [base, base+size), or all of them.
+static void vk_moe_cancel_queue_locked(moe_cache_device & dev, const void * base, size_t size, bool all) {
+    for (auto it = dev.queue.begin(); it != dev.queue.end();) {
+        if (all || moe_cache_ranges_overlap(it->source, it->bytes, base, size)) {
+            dev.queued_bytes = it->bytes <= dev.queued_bytes ? dev.queued_bytes - it->bytes : 0;
+            if (it->pool >= 0 && it->pool < (int)dev.pools.size()) {
+                moe_cache_pool & pool = *dev.pools[it->pool];
+                if (it->slot >= 0 && it->slot < pool.n_slots) {
+                    moe_cache_slot & slot = pool.slots[it->slot];
+                    if (slot.state == moe_cache_slot_state::copying &&
+                        slot.generation == it->generation && slot.key == it->key) {
+                        moe_cache_slot_reset(pool, it->slot, true);
+                    }
+                }
+            }
+            it = dev.queue.erase(it);
+        } else {
+            ++it;
+        }
     }
 }
 
@@ -964,10 +1240,18 @@ static void vk_moe_session_destroy(void * opaque) {
         // freeing device resources a CPU worker may still be using.
         std::unique_lock<std::mutex> lock(session->mu);
         session->stopping = true;
+        for (auto & dev_ptr : session->devices) {
+            vk_moe_cancel_queue_locked(*dev_ptr, nullptr, 0, true);
+        }
         session->cv.notify_all();
         session->idle_cv.wait(lock, [&] {
             return session->active_scopes == 0 && session->active_nodes == 0;
         });
+    }
+    for (auto & dev_ptr : session->devices) {
+        if (dev_ptr->worker_started && dev_ptr->worker.joinable()) {
+            dev_ptr->worker.join();
+        }
     }
     {
         std::lock_guard<std::mutex> lock(g_registry_mu);
@@ -1042,6 +1326,15 @@ static void vk_moe_session_leave(void * opaque) {
 // Begin: find pool, create node. Pools are created lazily on first use.
 // ---------------------------------------------------------------------------
 
+static void vk_moe_release_source_locked(moe_cache_session & session, const void * host_base) {
+    auto source = session.active_sources.find(host_base);
+    if (source != session.active_sources.end() && --source->second.references == 0) {
+        session.active_sources.erase(source);
+    }
+    session.active_nodes--;
+    session.idle_cv.notify_all();
+}
+
 static void * vk_moe_begin(const char * name, const void * host_base,
                            size_t expert_size, int64_t n_in, int64_t n_out,
                            int wtype, int64_t n_expert, int64_t n_tokens,
@@ -1068,6 +1361,7 @@ static void * vk_moe_begin(const char * name, const void * host_base,
     const size_t row_size = ggml_row_size((ggml_type)wtype, n_in);
     if (row_size == 0 || (uint64_t)n_out > SIZE_MAX / row_size ||
         expert_size != (size_t)n_out * row_size ||
+        (uint64_t)n_expert > SIZE_MAX / expert_size ||
         expert_size > SIZE_MAX / moe_cache_pool_slots_min) {
         return nullptr;
     }
@@ -1077,46 +1371,64 @@ static void * vk_moe_begin(const char * name, const void * host_base,
     }
     moe_cache_vulkan_device & dev =
         static_cast<moe_cache_vulkan_device &>(*session->devices[0]);
-    // A zero budget can never create a pool; skip GPU setup entirely.
-    if (session->config.budget_mb == 0) {
-        return nullptr;
-    }
     // Create the command pool and compile the pipelines on first use, before
     // the dispatch lock so a one-time compile does not block other workers.
-    if (!vk_device_ensure_ready(dev, session->config.budget_mb)) {
+    if (!vk_device_ensure_ready(dev)) {
         return nullptr;
     }
-
-    std::unique_lock<std::mutex> dispatch_lock;
-    try {
-        dispatch_lock = std::unique_lock<std::mutex>(
-                dev.dispatch_mu, std::try_to_lock);
-    } catch (...) {
-        dev.contention_bypasses++;
-        return nullptr;
-    }
-    if (!dispatch_lock.owns_lock()) {
-        dev.contention_bypasses++;
-        return nullptr;
-    }
-    if (dev.dead.load()) {
-        return nullptr;
-    }
-
     moe_cache_log_configuration(*session);
-    const size_t budget_bytes = session->config.budget_mb << 20;
-    moe_cache_pool * pool = vk_moe_find_or_create_pool(
-            dev, *session, expert_size, wtype, n_expert, budget_bytes);
-    if (!pool) {
-        return nullptr;
+
+    const size_t tensor_size = (size_t)n_expert * expert_size;
+    moe_cache_pool * pool = nullptr;
+    int pool_index = -1;
+    {
+        std::lock_guard<std::mutex> lock(session->mu);
+        if (session->stopping || dev.dead.load()) {
+            return nullptr;
+        }
+        if (!vk_moe_prepare_budget(*session, dev) ||
+            (session->config.automatic && dev.budget_limit < session->config.minimum_slab_bytes)) {
+            if (session->config.automatic) {
+                MOE_CACHE_LOG("[moe-cache] session dormant: no device satisfies the %zu MiB automatic slab floor\n",
+                        session->config.minimum_slab_bytes >> 20);
+            }
+            session->dormant.store(true);
+            return nullptr;
+        }
+        try {
+            pool_index = vk_moe_discover_pool(*session, dev, host_base, tensor_size,
+                                              expert_size, wtype, n_expert);
+        } catch (...) {
+            return nullptr;
+        }
+        if (pool_index < 0 || pool_index >= (int)dev.pools.size()) {
+            return nullptr;
+        }
+        pool = dev.pools[pool_index].get();
+        try {
+            moe_cache_session::active_source & source = session->active_sources[host_base];
+            source.bytes = std::max(source.bytes, tensor_size);
+            source.references++;
+        } catch (...) {
+            return nullptr;
+        }
+        session->active_nodes++;
     }
-    const int pool_index = moe_cache_find_pool(dev, expert_size, wtype);
-    if (pool_index < 0) {
+
+    std::unique_lock<std::mutex> dispatch_lock(dev.dispatch_mu, std::try_to_lock);
+    if (!dispatch_lock.owns_lock() || dev.dead.load()) {
+        std::lock_guard<std::mutex> lock(session->mu);
+        if (!dispatch_lock.owns_lock()) {
+            dev.contention_bypasses++;
+        }
+        vk_moe_release_source_locked(*session, host_base);
         return nullptr;
     }
 
     std::unique_ptr<moe_cache_node> node(new (std::nothrow) moe_cache_node());
     if (!node) {
+        std::lock_guard<std::mutex> lock(session->mu);
+        vk_moe_release_source_locked(*session, host_base);
         return nullptr;
     }
     node->session = session;
@@ -1131,17 +1443,118 @@ static void * vk_moe_begin(const char * name, const void * host_base,
     node->n_tokens = n_tokens;
     node->wtype = wtype;
     node->dispatch_lock = std::move(dispatch_lock);
-
-    // Own the node for the caller; destroy() waits for this to reach zero.
-    std::lock_guard<std::mutex> session_lock(session->mu);
-    session->active_nodes++;
     return node.release();
 }
 
 // ---------------------------------------------------------------------------
-// Plan: mark cache hits; sync-fill a bounded number of misses into the slab
-// and serve them in this node. slot_indices[i] >= 0 means cache-served.
+// Plan: mark cache hits and queue admitted misses for the fill worker.
+// slot_indices[i] >= 0 means cache-served.
 // ---------------------------------------------------------------------------
+
+// A resident expert returns its slot. A miss counts toward admission and,
+// once admitted, claims a slot and queues the fill for the worker; the row
+// stays on the CPU this time.
+static int vk_moe_lookup_or_queue_locked(moe_cache_session & session, moe_cache_device & dev,
+                                         moe_cache_pool & pool, int pool_index,
+                                         const void * host_base, int32_t expert, size_t expert_size,
+                                         int & inserts_left, bool & wake_worker) {
+    const moe_cache_key key{host_base, expert};
+    auto found = pool.map.find(key);
+    if (found != pool.map.end()) {
+        return pool.slots[found->second].state == moe_cache_slot_state::valid ? found->second : -1;
+    }
+
+    moe_cache_demand * demand = nullptr;
+    try {
+        demand = &dev.demand_count[key];
+    } catch (...) {
+        dev.insert_skips++;
+        return -1;
+    }
+    demand->expert_size = expert_size;
+    if (demand->count < std::numeric_limits<uint16_t>::max()) {
+        demand->count++;
+    }
+    const int initial_admit_after =
+        pool.covers_all_entries && !session.config.admit_after_explicit ? 1 : session.config.admit_after;
+    const int admit_after = pool.free_slots.empty()
+        ? std::max(initial_admit_after, session.config.readmit_after)
+        : initial_admit_after;
+    if (demand->count < admit_after) {
+        dev.admission_skips++;
+        return -1;
+    }
+    const size_t queue_limit = session.config.queue_mb << 20;
+    if (inserts_left <= 0 || (int)dev.queue.size() >= session.config.queue_max ||
+        expert_size > queue_limit - std::min(queue_limit, dev.queued_bytes)) {
+        dev.insert_skips++;
+        return -1;
+    }
+
+    int slot_index = -1;
+    if (!pool.free_slots.empty()) {
+        slot_index = pool.free_slots.back();
+        pool.free_slots.pop_back();
+    } else {
+        slot_index = moe_cache_pick_victim(pool, session.config.hot_uses);
+        if (slot_index < 0) {
+            dev.insert_skips++;
+            return -1;
+        }
+        const bool sacrificed_hot = (int)pool.slots[slot_index].uses > session.config.hot_uses;
+        moe_cache_slot_reset(pool, slot_index, false);
+        dev.evictions++;
+        if (sacrificed_hot) {
+            dev.heat_evictions++;
+        }
+    }
+
+    moe_cache_slot & slot = pool.slots[slot_index];
+    slot.key = key;
+    slot.generation++;
+    slot.readers = 0;
+    slot.state = moe_cache_slot_state::copying;
+    try {
+        if (!pool.map.emplace(key, slot_index).second) {
+            moe_cache_slot_reset(pool, slot_index, true);
+            dev.insert_skips++;
+            return -1;
+        }
+        const void * source = (const char *)host_base + (size_t)expert * expert_size;
+        dev.queue.push_back({pool_index, slot_index, slot.generation, key, source, expert_size});
+        dev.queued_bytes += expert_size;
+    } catch (...) {
+        moe_cache_slot_reset(pool, slot_index, true);
+        dev.insert_skips++;
+        return -1;
+    }
+    dev.inserts++;
+    inserts_left--;
+    wake_worker = true;
+    return -1;
+}
+
+// Rows handed back to the CPU when every row hits, so the CPU threads work
+// while the GPU runs instead of only waiting for it.
+static int vk_moe_overlap_rows(const moe_cache_node & node, int n_ids) {
+    const int configured = node.session->config.overlap_cpu_rows;
+    if (configured >= 0) {
+        return std::min(configured, std::max(0, n_ids - 1));
+    }
+    if (n_ids <= 1 || node.n_tokens <= 0 || n_ids % node.n_tokens != 0) {
+        return 0;
+    }
+    const int n_tokens = (int)node.n_tokens;
+    const int top_k = n_ids / n_tokens;
+    int rows = (int)std::min<size_t>(moe_cache_overlap_bytes_per_token * (size_t)n_tokens / node.expert_size, INT_MAX);
+    rows = std::max(rows, 1);
+    if (top_k >= 8) {
+        rows = std::max(rows, 2);
+    }
+    rows = std::min(rows, std::max(1, n_ids / 4));
+    rows = std::min(rows, std::max(2, n_tokens));
+    return std::min(rows, n_ids - 1);
+}
 
 static int vk_moe_plan(void * opaque, const int32_t * ids, int n_ids,
                        int32_t * slot_indices) {
@@ -1156,216 +1569,121 @@ static int vk_moe_plan(void * opaque, const int32_t * ids, int n_ids,
     }
 
     moe_cache_session & session = *node->session;
-    moe_cache_vulkan_device & dev =
-        static_cast<moe_cache_vulkan_device &>(*node->device);
+    moe_cache_device & dev = *node->device;
     moe_cache_pool & pool = *node->pool;
     int hits = 0;
+    int inserts_left = session.config.inserts_per_plan;
+    bool wake_worker = false;
 
     std::unique_lock<std::mutex> lock(session.mu);
     if (session.stopping) {
         return 0;
     }
-
-    // First pass: count misses and bound fills.
-    int n_misses = 0;
-    int n_fills = 0;
-    const size_t max_fill_bytes = session.config.queue_mb << 20;
-    if (max_fill_bytes == 0 || node->expert_size > max_fill_bytes) {
-        n_fills = 0;
-    } else {
-        n_fills = std::min((int)session.config.inserts_per_plan,
-                           (int)(max_fill_bytes / node->expert_size));
-    }
     for (int index = 0; index < n_ids; index++) {
         const int32_t expert = ids[index];
         if (expert < 0 || expert >= node->n_expert || dev.dead.load()) {
             continue;
         }
-        const moe_cache_key key{node->host_base, expert};
-        if (pool.map.find(key) == pool.map.end() ||
-            pool.slots[pool.map.at(key)].state != moe_cache_slot_state::valid) {
-            n_misses++;
-        }
-    }
-    const int fill_budget = std::min(n_misses, n_fills);
-
-    // Pre-fill stage: host-visible slabs are filled inline; device-local
-    // slabs are filled through the staging buffer in one batch. Pending
-    // slots stay in 'copying' until the batch transfer is confirmed so a
-    // failed submit can never publish stale slab bytes as a hit.
-    struct pending_fill {
-        int slot;
-        int index; // ids[] / slot_indices[] position
-    };
-    std::vector<pending_fill> pending;
-    vk_buf * slab_buf = nullptr;
-    if (node->pool_index >= 0 &&
-        node->pool_index < (int)dev.pool_buffers.size()) {
-        slab_buf = &dev.pool_buffers[node->pool_index];
-    }
-
-    if (fill_budget > 0 && !dev.host_mapped) {
-        // reserve staging for all payloads
-        const size_t fill_bytes = (size_t)fill_budget * node->expert_size;
-        if (!vk_buf_reserve(dev, dev.staging, fill_bytes,
-                            VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
-            return hits; // no fills, keep hits
-        }
-    }
-
-    int fills_done = 0;
-    for (int index = 0; index < n_ids; index++) {
-        const int32_t expert = ids[index];
-        if (expert < 0 || expert >= node->n_expert || dev.dead.load()) {
+        const int slot_index = vk_moe_lookup_or_queue_locked(
+                session, dev, pool, node->pool_index, node->host_base, expert,
+                node->expert_size, inserts_left, wake_worker);
+        if (slot_index < 0) {
+            dev.misses++;
             continue;
         }
-
-        const moe_cache_key key{node->host_base, expert};
-        auto found = pool.map.find(key);
-        if (found != pool.map.end() &&
-            pool.slots[found->second].state == moe_cache_slot_state::valid) {
-            const int slot_index = found->second;
-            moe_cache_slot & slot = pool.slots[slot_index];
-            slot.readers++;
-            slot.uses++;
-            moe_cache_lru_remove(pool, slot_index);
-            moe_cache_lru_push_back(pool, slot_index);
-            node->pins[node->n_pins++] = {&pool, slot_index};
-            slot_indices[index] = slot_index;
-            dev.hits++;
-            hits++;
-            continue;
-        }
-
-        // miss
-        dev.misses++;
-        if (moe_cache_fail(session, "insert")) {
-            dev.fill_failures++;
-            continue;
-        }
-        if (fills_done >= fill_budget) {
-            continue; // CPU handles this row
-        }
-        fills_done++;
-
-        int slot_index = -1;
-        if (!pool.free_slots.empty()) {
-            slot_index = pool.free_slots.back();
-            pool.free_slots.pop_back();
-        } else {
-            int candidate = moe_cache_pick_victim(pool, session.config.hot_uses);
-            if (candidate < 0) {
-                continue; // all slots pinned; CPU handles this row
-            }
-            slot_index = candidate;
-            const bool sacrificed_hot =
-                (int)pool.slots[slot_index].uses > session.config.hot_uses;
-            moe_cache_slot_reset(pool, slot_index, false);
-            dev.evictions++;
-            if (sacrificed_hot) {
-                dev.heat_evictions++;
-            }
-        }
-
         moe_cache_slot & slot = pool.slots[slot_index];
-        slot.key = key;
-        slot.generation++;
-        slot.state = moe_cache_slot_state::copying;
-        const void * source =
-            (const char *)node->host_base + (size_t)expert * node->expert_size;
-        try {
-            pool.map.emplace(key, slot_index);
-        } catch (...) {
-            moe_cache_slot_reset(pool, slot_index, true);
-            dev.insert_skips++;
-            continue;
-        }
-
-        if (dev.host_mapped && pool.slab) {
-            memcpy(pool.slab + (size_t)slot_index * node->expert_size,
-                   source, node->expert_size);
-            // Host-mapped fill is a plain memcpy that cannot fail; promote now.
-            slot.state = moe_cache_slot_state::valid;
-            moe_cache_lru_push_back(pool, slot_index);
-            slot.readers++;
-            node->pins[node->n_pins++] = {&pool, slot_index};
-            slot_indices[index] = slot_index;
-            dev.inserts++;
-            dev.fills++;
-            dev.hits++;
-            hits++;
-        } else if (slab_buf) {
-            memcpy((char *)dev.staging.mapped +
-                       (size_t)(fills_done - 1) * node->expert_size,
-                   source, node->expert_size);
-            pending.push_back({slot_index, index});
-            // stays in 'copying' until the batch copy below succeeds
+        slot.readers++;
+        slot.uses++;
+        moe_cache_lru_remove(pool, slot_index);
+        moe_cache_lru_push_back(pool, slot_index);
+        node->pins[node->n_pins++] = {&pool, slot_index};
+        slot_indices[index] = slot_index;
+        dev.hits++;
+        hits++;
+    }
+    if (hits == n_ids) {
+        int rows = vk_moe_overlap_rows(*node, n_ids);
+        for (int index = n_ids - 1; index >= 0 && rows > 0; index--) {
+            if (slot_indices[index] < 0 || node->n_pins <= 0) {
+                continue;
+            }
+            const moe_cache_pin & pin = node->pins[node->n_pins - 1];
+            if (pin.slot != slot_indices[index]) {
+                continue;
+            }
+            moe_cache_slot & slot = pin.pool->slots[pin.slot];
+            if (slot.readers > 0) {
+                slot.readers--;
+            }
+            node->n_pins--;
+            slot_indices[index] = -1;
+            hits--;
+            rows--;
+            dev.overlap_rows++;
         }
     }
-
-    // Batch-copy staged payloads into the device-local slab, then promote
-    // the pending slots. On failure roll them back so a later node cannot
-    // consume the stale entries as hits.
-    if (!pending.empty() && !dev.host_mapped && slab_buf) {
-        const bool copy_ok = vk_submit_and_wait(dev, [&](VkCommandBuffer cmd) {
-            std::vector<VkBufferCopy> regions;
-            regions.reserve(pending.size());
-            for (size_t i = 0; i < pending.size(); i++) {
-                VkBufferCopy region = {};
-                region.srcOffset = (VkDeviceSize)i * node->expert_size;
-                region.dstOffset = (VkDeviceSize)pending[i].slot * node->expert_size;
-                region.size = node->expert_size;
-                regions.push_back(region);
-            }
-            vkCmdCopyBuffer(cmd, dev.staging.buffer, slab_buf->buffer,
-                            (uint32_t)regions.size(), regions.data());
-            return true;
-        });
-
-        if (copy_ok) {
-            for (const pending_fill & fill : pending) {
-                moe_cache_slot & pslot = pool.slots[fill.slot];
-                pslot.state = moe_cache_slot_state::valid;
-                moe_cache_lru_push_back(pool, fill.slot);
-                pslot.readers++;
-                node->pins[node->n_pins++] = {&pool, fill.slot};
-                slot_indices[fill.index] = fill.slot;
-                dev.inserts++;
-                dev.fills++;
-                dev.hits++;
-                hits++;
-            }
-        } else {
-            // Roll back: erase map entry, free the slot, keep slot_indices
-            // at -1 so the CPU path recomputes these rows. The slab contents
-            // are unknown after a failed transfer; mark the device dead so no
-            // later node can hit stale entries.
-            for (const pending_fill & fill : pending) {
-                moe_cache_slot_reset(pool, fill.slot, true);
-                dev.fill_failures++;
-            }
-            dev.dead.store(true);
-            MOE_CACHE_LOG("[moe-cache] Vulkan%d: staged fill transfer failed; "
-                          "rolled back %zu fills and disabled the device cache\n",
-                          dev.physical, pending.size());
-        }
-    }
-
     dev.nodes++;
+    lock.unlock();
+    if (wake_worker) {
+        session.cv.notify_all();
+    }
     return hits;
 }
 
+static VkPipeline vk_moe_select_pipeline(const moe_cache_vulkan_device & dev, int wtype) {
+    switch (wtype) {
+        case GGML_TYPE_Q8_0: return dev.pipeline_q8_0;
+        case GGML_TYPE_Q4_0: return dev.pipeline_q4_0;
+        case GGML_TYPE_Q4_K: return dev.pipeline_q4_K;
+        case GGML_TYPE_Q6_K: return dev.pipeline_q6_K;
+        case GGML_TYPE_Q5_K: return dev.pipeline_q5_K;
+        case GGML_TYPE_Q1_0: return dev.pipeline_q1_0;
+        case GGML_TYPE_Q2_0: return dev.pipeline_q2_0;
+        case GGML_TYPE_Q4_1: return dev.pipeline_q4_1;
+        case GGML_TYPE_Q5_0: return dev.pipeline_q5_0;
+        case GGML_TYPE_Q5_1: return dev.pipeline_q5_1;
+        case GGML_TYPE_Q2_K: return dev.pipeline_q2_K;
+        case GGML_TYPE_Q3_K: return dev.pipeline_q3_K;
+        case GGML_TYPE_IQ2_XXS: return dev.pipeline_iq2_xxs;
+        case GGML_TYPE_IQ2_XS: return dev.pipeline_iq2_xs;
+        case GGML_TYPE_IQ2_S: return dev.pipeline_iq2_s;
+        case GGML_TYPE_IQ3_XXS: return dev.pipeline_iq3_xxs;
+        case GGML_TYPE_IQ3_S: return dev.pipeline_iq3_s;
+        case GGML_TYPE_IQ1_S: return dev.pipeline_iq1_s;
+        case GGML_TYPE_IQ1_M: return dev.pipeline_iq1_m;
+        case GGML_TYPE_IQ4_NL: return dev.pipeline_iq4_nl;
+        case GGML_TYPE_IQ4_XS: return dev.pipeline_iq4_xs;
+        case GGML_TYPE_MXFP4: return dev.pipeline_mxfp4;
+        case GGML_TYPE_NVFP4: return dev.pipeline_nvfp4;
+        default: return VK_NULL_HANDLE;
+    }
+}
+
+// Wait for the node's matvec; false if it failed.
+static bool vk_moe_wait_dispatch(moe_cache_vulkan_device & dev) {
+    if (!dev.dispatch_pending) {
+        return true;
+    }
+    const VkResult result = vkWaitForFences(dev.vk_device, 1, &dev.dispatch_fence, VK_TRUE, UINT64_MAX);
+    vkResetFences(dev.vk_device, 1, &dev.dispatch_fence);
+    dev.dispatch_pending = false;
+    if (result != VK_SUCCESS) {
+        dev.dead.store(true);
+        return false;
+    }
+    return true;
+}
+
 // ---------------------------------------------------------------------------
-// Dispatch: run the Vulkan matvec kernel over the hit rows.
+// Dispatch: submit the Vulkan matvec over the hit rows and return; the CPU
+// computes the misses while it runs and collect() waits for it.
 // ---------------------------------------------------------------------------
 
 static int vk_moe_dispatch(void * opaque, int wtype, int64_t n_in, int64_t n_out,
                            int n_hits, const int32_t * slot_indices,
                            const float * const * act_rows) {
     moe_cache_node * node = (moe_cache_node *)opaque;
-    if (!node || !node->planned || !slot_indices || !act_rows ||
+    if (!node || !node->planned || node->dispatched || !slot_indices || !act_rows ||
         n_hits <= 0 || n_hits > moe_cache_node_rows_max ||
         n_hits != node->n_pins ||
         wtype != node->wtype || n_in != node->n_in || n_out != node->n_out) {
@@ -1379,209 +1697,117 @@ static int vk_moe_dispatch(void * opaque, int wtype, int64_t n_in, int64_t n_out
         dev.dispatch_failures++;
         return 0;
     }
-    const size_t pool_index = (size_t)node->pool_index >= 0
-        ? (size_t)node->pool_index : 0;
-    if (dev.pool_buffers.empty() || pool_index >= dev.pool_buffers.size()) {
+    if (node->pool_index < 0 || node->pool_index >= (int)dev.pool_buffers.size()) {
         return 0;
     }
-    vk_buf & slab_buf = dev.pool_buffers[pool_index];
+    const VkBuffer slab = dev.pool_buffers[node->pool_index].buffer;
+    const VkPipeline pipeline = vk_moe_select_pipeline(dev, wtype);
+    if (!pipeline || !vk_moe_wait_dispatch(dev)) {
+        return 0;
+    }
 
     const int64_t padded_n_in = ((n_in + QK8_1 - 1) / QK8_1) * QK8_1;
-    const int64_t expert_stride = node->expert_size;
-    const int64_t row_stride = ggml_row_size((ggml_type)wtype, n_in);
-
-    const VkMemoryPropertyFlags host_props =
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    const VkMemoryPropertyFlags dev_props = dev.host_mapped
-        ? (VkMemoryPropertyFlags)(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
-                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                  VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
-        : (VkMemoryPropertyFlags)VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-    VkBufferUsageFlags dev_usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-    if (!dev.host_mapped) {
-        dev_usage |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    }
-
+    const int64_t blocks_per_row = padded_n_in / QK8_1;
     const VkDeviceSize ids_bytes = (VkDeviceSize)n_hits * sizeof(int32_t);
-    const VkDeviceSize act_bytes = (VkDeviceSize)n_hits *
-        (padded_n_in / QK8_1) * sizeof(block_q8_1);
+    const VkDeviceSize act_bytes = (VkDeviceSize)n_hits * blocks_per_row * sizeof(block_q8_1);
     const VkDeviceSize out_bytes = (VkDeviceSize)n_hits * (VkDeviceSize)n_out * sizeof(float);
 
-    if (!vk_buf_reserve(dev, dev.ids_buf, ids_bytes, dev_usage, dev_props) ||
-        !vk_buf_reserve(dev, dev.act_buf, act_bytes, dev_usage, dev_props) ||
-        !vk_buf_reserve(dev, dev.out_buf, out_bytes, dev_usage, dev_props) ||
-        !vk_buf_reserve(dev, dev.params_buf, 6 * sizeof(int64_t),
-                        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, host_props)) {
+    if (!vk_buf_reserve_host(dev, dev.ids_buf, ids_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) ||
+        !vk_buf_reserve_host(dev, dev.act_buf, act_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) ||
+        !vk_buf_reserve_host(dev, dev.out_buf, out_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) ||
+        !vk_buf_reserve_host(dev, dev.params_buf, 7 * sizeof(int64_t), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)) {
+        std::lock_guard<std::mutex> lock(node->session->mu);
+        dev.dispatch_failures++;
         return 0;
     }
 
-    // select pipeline by weight type
-    VkPipeline pipeline = dev.pipeline_q8_0;
-    switch (wtype) {
-        case GGML_TYPE_Q8_0: pipeline = dev.pipeline_q8_0; break;
-        case GGML_TYPE_Q4_0: pipeline = dev.pipeline_q4_0; break;
-        case GGML_TYPE_Q4_K: pipeline = dev.pipeline_q4_K; break;
-        case GGML_TYPE_Q6_K: pipeline = dev.pipeline_q6_K; break;
-        case GGML_TYPE_Q5_K: pipeline = dev.pipeline_q5_K; break;
-        case GGML_TYPE_Q1_0: pipeline = dev.pipeline_q1_0; break;
-        case GGML_TYPE_Q2_0: pipeline = dev.pipeline_q2_0; break;
-        case GGML_TYPE_Q4_1: pipeline = dev.pipeline_q4_1; break;
-        case GGML_TYPE_Q5_0: pipeline = dev.pipeline_q5_0; break;
-        case GGML_TYPE_Q5_1: pipeline = dev.pipeline_q5_1; break;
-        case GGML_TYPE_Q2_K: pipeline = dev.pipeline_q2_K; break;
-        case GGML_TYPE_Q3_K: pipeline = dev.pipeline_q3_K; break;
-        case GGML_TYPE_IQ2_XXS: pipeline = dev.pipeline_iq2_xxs; break;
-        case GGML_TYPE_IQ2_XS: pipeline = dev.pipeline_iq2_xs; break;
-        case GGML_TYPE_IQ2_S: pipeline = dev.pipeline_iq2_s; break;
-        case GGML_TYPE_IQ3_XXS: pipeline = dev.pipeline_iq3_xxs; break;
-        case GGML_TYPE_IQ3_S: pipeline = dev.pipeline_iq3_s; break;
-        case GGML_TYPE_IQ1_S: pipeline = dev.pipeline_iq1_s; break;
-        case GGML_TYPE_IQ1_M: pipeline = dev.pipeline_iq1_m; break;
-        case GGML_TYPE_IQ4_NL: pipeline = dev.pipeline_iq4_nl; break;
-        case GGML_TYPE_IQ4_XS: pipeline = dev.pipeline_iq4_xs; break;
-        case GGML_TYPE_MXFP4: pipeline = dev.pipeline_mxfp4; break;
-        case GGML_TYPE_NVFP4: pipeline = dev.pipeline_nvfp4; break;
-        default: break;
-    }
-    if (!pipeline) {
-        return 0;
-    }
-
-    // quantize activations into host scratch
-    const size_t act_bytes_needed =
-        (size_t)n_hits * (size_t)(padded_n_in / QK8_1) * sizeof(block_q8_1);
-    if (act_bytes_needed > dev.h_act_cap_bytes) {
-        try {
-            dev.h_act.resize((act_bytes_needed + sizeof(float) - 1) / sizeof(float));
-        } catch (...) {
-            return 0;
-        }
-        dev.h_act_cap_bytes = act_bytes_needed;
-    }
-    block_q8_1 * act_q8 = (block_q8_1 *)dev.h_act.data();
+    // Quantize each distinct activation row once; rows of one token share it.
+    block_q8_1 * act_q8 = (block_q8_1 *)dev.act_buf.mapped;
     for (int i = 0; i < n_hits; i++) {
-        vk_quantize_act_q8_1(act_rows[i], act_q8 + i * (padded_n_in / QK8_1),
-                             n_in, padded_n_in);
-    }
-
-    // host-visible buffers are written directly; device-local buffers are
-    // staged. Staging layout: [0, ids) ids, [ids, ids+act) acts,
-    // [ids+act, ids+act+out) results. The result region is disjoint from
-    // the upload regions, so no same-buffer hazard exists within the
-    // dispatch command buffer.
-    const VkDeviceSize out_stage_offset = ids_bytes + act_bytes;
-    if (dev.host_mapped) {
-        memcpy(dev.ids_buf.mapped, slot_indices, ids_bytes);
-        memcpy(dev.act_buf.mapped, act_q8, act_bytes);
-    } else {
-        const VkDeviceSize stage_need = ids_bytes + act_bytes + out_bytes;
-        if (!vk_buf_reserve(dev, dev.staging, stage_need,
-                            VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                            VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                            host_props)) {
-            return 0;
+        int j = 0;
+        while (j < i && act_rows[j] != act_rows[i]) {
+            j++;
         }
-        memcpy(dev.staging.mapped, slot_indices, ids_bytes);
-        memcpy((char *)dev.staging.mapped + ids_bytes, act_q8, act_bytes);
+        if (j < i) {
+            memcpy(act_q8 + i * blocks_per_row, act_q8 + j * blocks_per_row,
+                   blocks_per_row * sizeof(block_q8_1));
+        } else {
+            vk_quantize_act_q8_1(act_rows[i], act_q8 + i * blocks_per_row, n_in, padded_n_in);
+        }
     }
-
-    // params (host-visible, written before submit -> visible after submit)
-    int64_t params[6] = {n_in, n_out, expert_stride, row_stride, n_hits, padded_n_in};
+    memcpy(dev.ids_buf.mapped, slot_indices, ids_bytes);
+    const int64_t blocks = n_in / ggml_blck_size((ggml_type)wtype);
+    uint32_t threads_per_row = 1;
+    while (threads_per_row < blocks && threads_per_row < dev.max_threads_per_row) {
+        threads_per_row <<= 1;
+    }
+    const int64_t params[7] = {n_in, n_out, (int64_t)node->expert_size,
+                               (int64_t)ggml_row_size((ggml_type)wtype, n_in), n_hits, padded_n_in,
+                               threads_per_row};
     memcpy(dev.params_buf.mapped, params, sizeof(params));
 
-    // update descriptor set for this node
-    VkDescriptorBufferInfo slab_info = {slab_buf.buffer, 0, VK_WHOLE_SIZE};
-    VkDescriptorBufferInfo ids_info  = {dev.ids_buf.buffer, 0, VK_WHOLE_SIZE};
-    VkDescriptorBufferInfo act_info  = {dev.act_buf.buffer, 0, VK_WHOLE_SIZE};
-    VkDescriptorBufferInfo out_info  = {dev.out_buf.buffer, 0, VK_WHOLE_SIZE};
-    VkDescriptorBufferInfo params_info = {dev.params_buf.buffer, 0, 6 * sizeof(int64_t)};
-
+    // the previous node's commands have completed, so the set can be rewritten
+    VkDescriptorBufferInfo infos[5] = {
+        {slab, 0, VK_WHOLE_SIZE},
+        {dev.ids_buf.buffer, 0, VK_WHOLE_SIZE},
+        {dev.act_buf.buffer, 0, VK_WHOLE_SIZE},
+        {dev.out_buf.buffer, 0, VK_WHOLE_SIZE},
+        {dev.params_buf.buffer, 0, sizeof(params)},
+    };
     VkWriteDescriptorSet writes[5] = {};
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 5; i++) {
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = dev.ds;
         writes[i].dstBinding = i;
         writes[i].descriptorCount = 1;
-        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].descriptorType = i < 4 ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        writes[i].pBufferInfo = &infos[i];
     }
-    writes[0].pBufferInfo = &slab_info;
-    writes[1].pBufferInfo = &ids_info;
-    writes[2].pBufferInfo = &act_info;
-    writes[3].pBufferInfo = &out_info;
-    writes[4].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[4].dstSet = dev.ds;
-    writes[4].dstBinding = 4;
-    writes[4].descriptorCount = 1;
-    writes[4].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    writes[4].pBufferInfo = &params_info;
     vkUpdateDescriptorSets(dev.vk_device, 5, writes, 0, nullptr);
 
-    const uint32_t total_threads = (uint32_t)n_hits * (uint32_t)n_out;
-    const uint32_t n_groups = (total_threads + 255) / 256;
-
-    const bool ok = vk_submit_and_wait(dev, [&](VkCommandBuffer cmd) {
-        if (!dev.host_mapped) {
-            VkBufferCopy ids_region = {};
-            ids_region.size = ids_bytes;
-            vkCmdCopyBuffer(cmd, dev.staging.buffer, dev.ids_buf.buffer, 1, &ids_region);
-
-            VkBufferCopy act_region = {};
-            act_region.srcOffset = ids_bytes;
-            act_region.size = act_bytes;
-            vkCmdCopyBuffer(cmd, dev.staging.buffer, dev.act_buf.buffer, 1, &act_region);
-
-            VkBufferMemoryBarrier copy_barrier = {};
-            copy_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-            copy_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            copy_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-            copy_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            copy_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            VkBufferMemoryBarrier copy_barriers[2] = {copy_barrier, copy_barrier};
-            copy_barriers[0].buffer = dev.ids_buf.buffer;
-            copy_barriers[0].size = VK_WHOLE_SIZE;
-            copy_barriers[1].buffer = dev.act_buf.buffer;
-            copy_barriers[1].size = VK_WHOLE_SIZE;
-            vkCmdPipelineBarrier(cmd,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                    0, 0, nullptr, 2, copy_barriers, 0, nullptr);
-        }
-
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+    VkCommandBufferBeginInfo bi = {};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    bool ok = vkResetCommandBuffer(dev.dispatch_cmd, 0) == VK_SUCCESS &&
+              vkBeginCommandBuffer(dev.dispatch_cmd, &bi) == VK_SUCCESS;
+    if (ok) {
+        vkCmdBindPipeline(dev.dispatch_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+        vkCmdBindDescriptorSets(dev.dispatch_cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                 dev.pipeline_layout, 0, 1, &dev.ds, 0, nullptr);
-        vkCmdDispatch(cmd, n_groups, 1, 1);
+        const uint32_t rows = (uint32_t)n_hits * (uint32_t)n_out;
+        const uint32_t rows_per_group = 256 / threads_per_row;
+        vkCmdDispatch(dev.dispatch_cmd, (rows + rows_per_group - 1) / rows_per_group, 1, 1);
 
-        if (!dev.host_mapped) {
-            VkBufferMemoryBarrier out_barrier = {};
-            out_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-            out_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-            out_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-            out_barrier.buffer = dev.out_buf.buffer;
-            out_barrier.size = VK_WHOLE_SIZE;
-            out_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            out_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            vkCmdPipelineBarrier(cmd,
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                    0, 0, nullptr, 1, &out_barrier, 0, nullptr);
-
-            VkBufferCopy out_region = {};
-            out_region.dstOffset = out_stage_offset;
-            out_region.size = out_bytes;
-            vkCmdCopyBuffer(cmd, dev.out_buf.buffer, dev.staging.buffer, 1, &out_region);
-        }
-        return true;
-    });
-
+        // make the results visible to the host reads in collect()
+        VkMemoryBarrier barrier = {};
+        barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        vkCmdPipelineBarrier(dev.dispatch_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+        ok = vkEndCommandBuffer(dev.dispatch_cmd) == VK_SUCCESS;
+    }
+    if (ok) {
+        VkSubmitInfo si = {};
+        si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &dev.dispatch_cmd;
+        ggml_backend_vk_lock_queue(dev.vk_backend);
+        ok = vkQueueSubmit(dev.vk_queue, 1, &si, dev.dispatch_fence) == VK_SUCCESS;
+        ggml_backend_vk_unlock_queue(dev.vk_backend);
+    }
     if (!ok) {
+        std::lock_guard<std::mutex> lock(node->session->mu);
         dev.dispatch_failures++;
         return 0;
     }
+    dev.dispatch_pending = true;
     node->dispatched = true;
     return 1;
 }
 
 // ---------------------------------------------------------------------------
-// Collect: copy results into dst_rows.
+// Collect: wait for the matvec and copy the results into dst_rows.
 // ---------------------------------------------------------------------------
 
 static int vk_moe_collect(void * opaque, int n_hits, float * const * dst_rows,
@@ -1601,36 +1827,14 @@ static int vk_moe_collect(void * opaque, int n_hits, float * const * dst_rows,
     moe_cache_vulkan_device & dev =
         static_cast<moe_cache_vulkan_device &>(*node->device);
     moe_cache_session & session = *node->session;
-    bool ok = !dev.dead.load() && !moe_cache_fail(session, "collect");
+    bool ok = vk_moe_wait_dispatch(dev) && !dev.dead.load() && !moe_cache_fail(session, "collect");
+    node->dispatched = false;
     if (ok) {
-        const size_t out_bytes = (size_t)n_hits * (size_t)n_out * sizeof(float);
-        if (dev.host_mapped) {
-            // results already in the host-visible out buffer
-            const float * out = (const float *)dev.out_buf.mapped;
-            for (int index = 0; index < n_hits; index++) {
-                memcpy(dst_rows[index], out + (size_t)index * n_out,
-                       (size_t)n_out * sizeof(float));
-            }
-        } else {
-            // copy-back already landed in staging during dispatch
-            if (dev.staging.size < out_bytes || !dev.staging.mapped) {
-                ok = false;
-            } else {
-                const size_t padded_n_in =
-                    ((size_t)node->n_in + QK8_1 - 1) / QK8_1 * QK8_1;
-                const size_t act_bytes =
-                    (size_t)node->n_pins * (padded_n_in / QK8_1) * sizeof(block_q8_1);
-                const size_t out_stage_offset =
-                    (size_t)node->n_pins * sizeof(int32_t) + act_bytes;
-                const float * out = (const float *)dev.staging.mapped + out_stage_offset / sizeof(float);
-                for (int index = 0; index < n_hits; index++) {
-                    memcpy(dst_rows[index], out + (size_t)index * n_out,
-                           (size_t)n_out * sizeof(float));
-                }
-            }
+        const float * out = (const float *)dev.out_buf.mapped;
+        for (int index = 0; index < n_hits; index++) {
+            memcpy(dst_rows[index], out + (size_t)index * n_out, (size_t)n_out * sizeof(float));
         }
     }
-    node->dispatched = false;
     {
         std::lock_guard<std::mutex> lock(session.mu);
         if (!ok) {
@@ -1654,6 +1858,12 @@ static void vk_moe_end(void * opaque) {
     if (!node) {
         return;
     }
+    moe_cache_vulkan_device & dev =
+        static_cast<moe_cache_vulkan_device &>(*node->device);
+    // the GPU may still read the pinned slots until the matvec completes
+    vk_moe_wait_dispatch(dev);
+    node->dispatched = false;
+
     moe_cache_session & session = *node->session;
     {
         std::lock_guard<std::mutex> lock(session.mu);
@@ -1666,8 +1876,7 @@ static void vk_moe_end(void * opaque) {
                 }
             }
         }
-        session.active_nodes--;
-        session.idle_cv.notify_all();
+        vk_moe_release_source_locked(session, node->host_base);
     }
 }
 
@@ -1693,6 +1902,80 @@ static void * vk_moe_fused_begin(const ggml_moe_cache_tensor_desc * up,
 // Invalidate: drop cached slots whose tensor range overlaps [base, base+size).
 // ---------------------------------------------------------------------------
 
+static void vk_moe_invalidate_session(moe_cache_session & session, const void * base, size_t size) {
+    std::unique_lock<std::mutex> lock(session.mu);
+    for (auto & dev_ptr : session.devices) {
+        vk_moe_cancel_queue_locked(*dev_ptr, base, size, false);
+    }
+    // wait for nodes reading the range and for a fill copying from it
+    session.idle_cv.wait(lock, [&] {
+        for (const auto & active : session.active_sources) {
+            if (active.second.references > 0 &&
+                moe_cache_ranges_overlap(active.first, active.second.bytes, base, size)) {
+                return false;
+            }
+        }
+        for (const auto & dev_ptr : session.devices) {
+            if (dev_ptr->inflight &&
+                moe_cache_ranges_overlap(dev_ptr->inflight_source, dev_ptr->inflight_bytes, base, size)) {
+                return false;
+            }
+        }
+        return true;
+    });
+
+    for (auto & dev_ptr : session.devices) {
+        moe_cache_device & dev = *dev_ptr;
+        vk_moe_cancel_queue_locked(dev, base, size, false);
+        for (auto & pool_ptr : dev.pools) {
+            moe_cache_pool & pool = *pool_ptr;
+            for (int index = 0; index < pool.n_slots; index++) {
+                moe_cache_slot & slot = pool.slots[index];
+                const void * source = slot.key.expert >= 0
+                    ? (const char *)slot.key.tensor + (size_t)slot.key.expert * pool.expert_size
+                    : nullptr;
+                if (slot.state != moe_cache_slot_state::free &&
+                    moe_cache_ranges_overlap(source, pool.expert_size, base, size)) {
+                    moe_cache_slot_reset(pool, index, true);
+                }
+            }
+        }
+        for (auto it = dev.seen_tensors.begin(); it != dev.seen_tensors.end();) {
+            if (moe_cache_ranges_overlap(it->first, it->second.bytes, base, size)) {
+                for (moe_cache_shape & shape : dev.shapes) {
+                    if (shape.expert_size == it->second.expert_size && shape.wtype == it->second.wtype) {
+                        const uint64_t entries = (uint64_t)it->second.n_expert;
+                        shape.n_entries = entries <= shape.n_entries ? shape.n_entries - entries : 0;
+                        shape.n_tensors = std::max<int64_t>(shape.n_tensors - 1, 0);
+                        if (shape.pool >= 0 && shape.pool < (int)dev.pools.size()) {
+                            dev.pools[shape.pool]->covers_all_entries =
+                                (uint64_t)dev.pools[shape.pool]->n_slots >= shape.n_entries;
+                        }
+                        if (shape.n_tensors == 0 && shape.pool < 0) {
+                            shape.finished = false;
+                        }
+                        break;
+                    }
+                }
+                it = dev.seen_tensors.erase(it);
+                dev.visits_since_new_tensor = 0;
+            } else {
+                ++it;
+            }
+        }
+        for (auto it = dev.demand_count.begin(); it != dev.demand_count.end();) {
+            const void * source = it->first.expert >= 0
+                ? (const char *)it->first.tensor + (size_t)it->first.expert * it->second.expert_size
+                : nullptr;
+            if (moe_cache_ranges_overlap(source, it->second.expert_size, base, size)) {
+                it = dev.demand_count.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+}
+
 static void vk_moe_invalidate(const void * base, size_t size) {
     if (!base || size == 0) {
         return;
@@ -1702,19 +1985,7 @@ static void vk_moe_invalidate(const void * base, size_t size) {
     }
     std::lock_guard<std::mutex> registry_lock(g_registry_mu);
     for (moe_cache_session * session : g_sessions) {
-        std::lock_guard<std::mutex> lock(session->mu);
-        for (auto & dev_ptr : session->devices) {
-            for (auto & pool_ptr : dev_ptr->pools) {
-                for (int i = 0; i < pool_ptr->n_slots; i++) {
-                    if (pool_ptr->slots[i].key.tensor &&
-                        moe_cache_ranges_overlap(
-                            pool_ptr->slots[i].key.tensor,
-                            pool_ptr->expert_size, base, size)) {
-                        moe_cache_slot_reset(*pool_ptr, i, true);
-                    }
-                }
-            }
-        }
+        vk_moe_invalidate_session(*session, base, size);
     }
 }
 

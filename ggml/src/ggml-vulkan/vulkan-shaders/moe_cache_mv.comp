@@ -8,6 +8,7 @@
 // types.glsl uses [[unroll]] in the IQ table init functions pulled in by the
 // DATA_A_* defines.
 #extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_shuffle : require
 
 // types.glsl needs FLOAT_TYPE for the shared-memory tables it declares under
 // the DATA_A_* defines; this shader only uses the const tables.
@@ -15,7 +16,9 @@
 
 #include "types.glsl"
 
-// Layout: one thread per (hit, output row) pair.
+// Layout: threads_per_row threads per (hit, output row) pair; the
+// threads of a row read consecutive weight blocks, so a workgroup sweeps a
+// contiguous range of the expert.
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 // Buffer bindings
@@ -30,6 +33,7 @@ layout (binding = 4) uniform Params {
     int64_t row_stride;
     int64_t n_hits;
     int64_t padded_n_in;
+    int64_t threads_per_row;
 } p;
 
 // Select weight block type via preprocessor define (1=Q8_0, 2=Q4_0, 3=Q4_K, 4=Q6_K, 5=Q5_K).
@@ -827,77 +831,83 @@ float dot_block_nvfp4(const block_nvfp4 w, const uint ab) {
 #endif // MOE_CACHE_WTYPE == 23
 
 void main() {
-    // One thread per (hit, output row) pair, like the Metal kernel.
-    const uint id = gl_GlobalInvocationID.x;
-    const uint total = uint(p.n_hits) * uint(p.n_out);
-    if (id >= total) return;
-
-    const uint hit = id / uint(p.n_out);
-    const uint row = id - hit * uint(p.n_out);
-
-    const int slot = data_ids[hit];
-    if (slot < 0) {
-        data_dst[id] = 0.0f;
-        return;
-    }
-
-    // All byte offsets are exact multiples of the weight block size, so the
-    // block index is an exact integer division.
-    const int64_t byte_off = int64_t(slot) * p.expert_stride + int64_t(row) * p.row_stride;
-    const uint block_base = uint(byte_off / int64_t(WBLOCK_BYTES));
-    const uint act_base = hit * uint(p.padded_n_in / int64_t(32));
-
     const int nb = int(p.n_in / int64_t(WBLOCK_QK));
+    // a power of two that fits in a subgroup, chosen by the host
+    const uint tpr = uint(p.threads_per_row);
+    const uint lane = gl_LocalInvocationID.x % tpr;
+    const uint id = gl_WorkGroupID.x * (gl_WorkGroupSize.x / tpr) + gl_LocalInvocationID.x / tpr;
+    const uint total = uint(p.n_hits) * uint(p.n_out);
+    const bool in_range = id < total;
+
+    const uint hit = in_range ? id / uint(p.n_out) : 0u;
+    const uint row = in_range ? id - hit * uint(p.n_out) : 0u;
+    const int slot = in_range ? data_ids[hit] : -1;
+
     float sum = 0.0f;
-    for (int ib = 0; ib < nb; ib++) {
-        const uint ab = act_base + uint(ib) * ACT_BLOCKS_PER_WBLOCK;
+    if (slot >= 0) {
+        // All byte offsets are exact multiples of the weight block size, so the
+        // block index is an exact integer division.
+        const int64_t byte_off = int64_t(slot) * p.expert_stride + int64_t(row) * p.row_stride;
+        const uint block_base = uint(byte_off / int64_t(WBLOCK_BYTES));
+        const uint act_base = hit * uint(p.padded_n_in / int64_t(32));
+
+        for (int ib = int(lane); ib < nb; ib += int(tpr)) {
+            const uint ab = act_base + uint(ib) * ACT_BLOCKS_PER_WBLOCK;
 #if MOE_CACHE_WTYPE == 1
-        sum += dot_block_q8_0(data_slab[block_base + uint(ib)], data_act[ab]);
+            sum += dot_block_q8_0(data_slab[block_base + uint(ib)], data_act[ab]);
 #elif MOE_CACHE_WTYPE == 2
-        sum += dot_block_q4_0(data_slab[block_base + uint(ib)], data_act[ab]);
+            sum += dot_block_q4_0(data_slab[block_base + uint(ib)], data_act[ab]);
 #elif MOE_CACHE_WTYPE == 3
-        sum += dot_block_q4_K(data_slab[block_base + uint(ib)], ab);
+            sum += dot_block_q4_K(data_slab[block_base + uint(ib)], ab);
 #elif MOE_CACHE_WTYPE == 4
-        sum += dot_block_q6_K(data_slab[block_base + uint(ib)], ab);
+            sum += dot_block_q6_K(data_slab[block_base + uint(ib)], ab);
 #elif MOE_CACHE_WTYPE == 5
-        sum += dot_block_q5_K(data_slab[block_base + uint(ib)], ab);
+            sum += dot_block_q5_K(data_slab[block_base + uint(ib)], ab);
 #elif MOE_CACHE_WTYPE == 6
-        sum += dot_block_q1_0(data_slab[block_base + uint(ib)], ab);
+            sum += dot_block_q1_0(data_slab[block_base + uint(ib)], ab);
 #elif MOE_CACHE_WTYPE == 7
-        sum += dot_block_q2_0(data_slab[block_base + uint(ib)], ab);
+            sum += dot_block_q2_0(data_slab[block_base + uint(ib)], ab);
 #elif MOE_CACHE_WTYPE == 8
-        sum += dot_block_q4_1(data_slab[block_base + uint(ib)], data_act[ab]);
+            sum += dot_block_q4_1(data_slab[block_base + uint(ib)], data_act[ab]);
 #elif MOE_CACHE_WTYPE == 9
-        sum += dot_block_q5_0(data_slab[block_base + uint(ib)], data_act[ab]);
+            sum += dot_block_q5_0(data_slab[block_base + uint(ib)], data_act[ab]);
 #elif MOE_CACHE_WTYPE == 10
-        sum += dot_block_q5_1(data_slab[block_base + uint(ib)], data_act[ab]);
+            sum += dot_block_q5_1(data_slab[block_base + uint(ib)], data_act[ab]);
 #elif MOE_CACHE_WTYPE == 11
-        sum += dot_block_q2_K(data_slab[block_base + uint(ib)], ab);
+            sum += dot_block_q2_K(data_slab[block_base + uint(ib)], ab);
 #elif MOE_CACHE_WTYPE == 12
-        sum += dot_block_q3_K(data_slab[block_base + uint(ib)], ab);
+            sum += dot_block_q3_K(data_slab[block_base + uint(ib)], ab);
 #elif MOE_CACHE_WTYPE == 13
-        sum += dot_block_iq2_xxs(data_slab[block_base + uint(ib)], ab);
+            sum += dot_block_iq2_xxs(data_slab[block_base + uint(ib)], ab);
 #elif MOE_CACHE_WTYPE == 14
-        sum += dot_block_iq2_xs(data_slab[block_base + uint(ib)], ab);
+            sum += dot_block_iq2_xs(data_slab[block_base + uint(ib)], ab);
 #elif MOE_CACHE_WTYPE == 15
-        sum += dot_block_iq2_s(data_slab[block_base + uint(ib)], ab);
+            sum += dot_block_iq2_s(data_slab[block_base + uint(ib)], ab);
 #elif MOE_CACHE_WTYPE == 16
-        sum += dot_block_iq3_xxs(data_slab[block_base + uint(ib)], ab);
+            sum += dot_block_iq3_xxs(data_slab[block_base + uint(ib)], ab);
 #elif MOE_CACHE_WTYPE == 17
-        sum += dot_block_iq3_s(data_slab[block_base + uint(ib)], ab);
+            sum += dot_block_iq3_s(data_slab[block_base + uint(ib)], ab);
 #elif MOE_CACHE_WTYPE == 18
-        sum += dot_block_iq1_s(data_slab[block_base + uint(ib)], ab);
+            sum += dot_block_iq1_s(data_slab[block_base + uint(ib)], ab);
 #elif MOE_CACHE_WTYPE == 19
-        sum += dot_block_iq1_m(data_slab[block_base + uint(ib)], ab);
+            sum += dot_block_iq1_m(data_slab[block_base + uint(ib)], ab);
 #elif MOE_CACHE_WTYPE == 20
-        sum += dot_block_iq4_nl(data_slab[block_base + uint(ib)], ab);
+            sum += dot_block_iq4_nl(data_slab[block_base + uint(ib)], ab);
 #elif MOE_CACHE_WTYPE == 21
-        sum += dot_block_iq4_xs(data_slab[block_base + uint(ib)], ab);
+            sum += dot_block_iq4_xs(data_slab[block_base + uint(ib)], ab);
 #elif MOE_CACHE_WTYPE == 22
-        sum += dot_block_mxfp4(data_slab[block_base + uint(ib)], data_act[ab]);
+            sum += dot_block_mxfp4(data_slab[block_base + uint(ib)], data_act[ab]);
 #elif MOE_CACHE_WTYPE == 23
-        sum += dot_block_nvfp4(data_slab[block_base + uint(ib)], ab);
+            sum += dot_block_nvfp4(data_slab[block_base + uint(ib)], ab);
 #endif
+        }
     }
-    data_dst[id] = sum;
+
+    // the row's threads are adjacent and aligned to tpr within the subgroup
+    for (uint off = tpr >> 1; off > 0u; off >>= 1) {
+        sum += subgroupShuffleXor(sum, off);
+    }
+    if (in_range && lane == 0u) {
+        data_dst[id] = sum;
+    }
 }
